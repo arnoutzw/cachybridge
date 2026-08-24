@@ -18,10 +18,10 @@ An end-to-end run without physical input devices uses `client --dry-run` and `ho
 
 The Qt 6 Widgets wizard offers the normal **Easy one-time pairing** flow:
 
-1. On the input-owner iMac, choose **Show one-time pairing code** and select
-   the client placement.
-2. On the other iMac, choose **Join with a one-time code**, entering the host
-   LAN address and displayed code.
+1. On the controlled client iMac, choose **Show one-time code on this client
+   iMac**.
+2. On the input-owner host iMac, choose **Connect host to client with code**,
+   entering the client LAN address, displayed code, and client placement.
 3. Both machines save the new peer automatically; the code expires after five
    minutes and works for one successful join only.
 
@@ -51,13 +51,13 @@ or requests consent.
 The same workflow is available to installers and automation without a GUI:
 
 ```bash
-# Input-owner iMac: show the generated code, then wait for one join.
+# Controlled client iMac: show the generated code, then wait for its host.
 cachybridge pair-code
-cachybridge pair-host --code "$PAIR_CODE" --placement left
+cachybridge pair-client --code "$PAIR_CODE"
 
-# Other iMac: enter that code and the host address shown by setup.
-cachybridge pair-join --connect 192.168.2.226:45232 \
-  --code "$PAIR_CODE" --local-name "Left iMac"
+# Input-owner host iMac: enter that code and the client address shown by setup.
+cachybridge pair-host --connect 192.168.2.24:45232 \
+  --code "$PAIR_CODE" --local-name "Host iMac" --placement left
 ```
 
 `$PAIR_CODE` denotes the code printed by `cachybridge pair-code`.

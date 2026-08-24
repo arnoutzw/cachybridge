@@ -91,11 +91,12 @@ enum Command {
         output: Option<PathBuf>,
     },
     /// Print a short, 128-bit one-time pairing code. It can be entered with or
-    /// without dashes, and is consumed by `pair-host` / `pair-join`.
+    /// without dashes, and is consumed by `pair-client` / `pair-host`.
     PairCode,
-    /// Wait for one client to join using a one-time pairing code, then save a
-    /// fresh long-term peer key locally. The code is never saved.
-    PairHost {
+    /// Run on the controlled client: wait for one input-owner host to connect
+    /// using a one-time code, then save a fresh long-term peer key locally.
+    /// The code is never saved.
+    PairClient {
         /// Bind address shown to the joining machine. Use a LAN IP or 0.0.0.0.
         #[arg(long, default_value_t = default_pairing_listen_address())]
         listen: SocketAddr,
@@ -108,10 +109,7 @@ enum Command {
         /// Friendly local name saved in the pairing configuration.
         #[arg(long)]
         local_name: Option<String>,
-        /// Where the joining client display sits relative to this host.
-        #[arg(long, value_enum, default_value_t = CliPlacement::Left)]
-        placement: CliPlacement,
-        /// Port where this host's regular seamless service will run.
+        /// Port where this controlled client's regular seamless service runs.
         #[arg(long, default_value_t = DEFAULT_PORT)]
         service_port: u16,
         /// Store persistent portal permissions for this peer.
@@ -121,25 +119,28 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         timeout_seconds: u64,
     },
-    /// Join a host that is displaying a one-time pairing code. This stores the
-    /// received long-term key locally; the code itself is discarded.
-    PairJoin {
-        /// Host address displayed by its setup window, normally port 45232.
+    /// Run on the input-owner host: connect to a client displaying a one-time
+    /// pairing code. This stores the received long-term key locally.
+    PairHost {
+        /// Client address displayed by its setup window, normally port 45232.
         #[arg(long)]
         connect: SocketAddr,
-        /// The code shown by the host.
+        /// The code shown by the client.
         #[arg(long)]
         code: String,
         /// Use this configuration file instead of the normal per-user path.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Friendly name for this joining machine.
+        /// Friendly name for this input-owner host.
         #[arg(long)]
         local_name: String,
-        /// Port where this machine's regular seamless service will run.
+        /// Where the client display sits relative to this host.
+        #[arg(long, value_enum, default_value_t = CliPlacement::Left)]
+        placement: CliPlacement,
+        /// Port where this host's regular seamless service will run.
         #[arg(long, default_value_t = DEFAULT_PORT)]
         service_port: u16,
-        /// Request persistent portal permissions for this peer.
+        /// Store persistent portal permissions for this peer.
         #[arg(long)]
         persistent_permissions: bool,
     },
@@ -488,37 +489,37 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", pairing::generate_code());
             Ok(())
         }
-        Command::PairHost {
+        Command::PairClient {
             listen,
+            code,
+            config: config_override,
+            local_name,
+            service_port,
+            persistent_permissions,
+            timeout_seconds,
+        } => run_pair_client(
+            listen,
+            &code,
+            config_override,
+            local_name,
+            service_port,
+            persistent_permissions,
+            Duration::from_secs(timeout_seconds),
+        ),
+        Command::PairHost {
+            connect,
             code,
             config: config_override,
             local_name,
             placement,
             service_port,
             persistent_permissions,
-            timeout_seconds,
         } => run_pair_host(
-            listen,
+            connect,
             &code,
             config_override,
             local_name,
             placement.into(),
-            service_port,
-            persistent_permissions,
-            Duration::from_secs(timeout_seconds),
-        ),
-        Command::PairJoin {
-            connect,
-            code,
-            config: config_override,
-            local_name,
-            service_port,
-            persistent_permissions,
-        } => run_pair_join(
-            connect,
-            &code,
-            config_override,
-            local_name,
             service_port,
             persistent_permissions,
         ),
@@ -746,12 +747,11 @@ fn load_psk(options: &PskOptions) -> Result<[u8; 32], Box<dyn std::error::Error>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_pair_host(
+fn run_pair_client(
     listen: SocketAddr,
     code: &str,
     config_override: Option<PathBuf>,
     local_name: Option<String>,
-    placement: config::RelativePlacement,
     service_port: u16,
     persistent_permissions: bool,
     timeout: Duration,
@@ -773,7 +773,7 @@ fn run_pair_host(
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
     eprintln!(
-        "pairing host ready on {}; waiting up to {} seconds for one code-authenticated client",
+        "pairing client ready on {}; waiting up to {} seconds for one code-authenticated host",
         listener.local_addr()?,
         timeout.as_secs()
     );
@@ -792,19 +792,19 @@ fn run_pair_host(
                 stream.set_write_timeout(Some(Duration::from_secs(10)))?;
                 let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let mut connection =
-                        SecureConnection::connect(stream, Role::Host, &temporary_psk)?;
+                        SecureConnection::connect(stream, Role::Client, &temporary_psk)?;
                     let request = pairing::decode_request(&connection.receive_payload()?)?;
-                    let host_endpoint = pairing::checked_endpoint(local.ip(), service_port)?;
-                    let client_endpoint =
-                        pairing::checked_endpoint(remote.ip(), request.client_service_port)?;
+                    let host_endpoint =
+                        pairing::checked_endpoint(remote.ip(), request.host_service_port)?;
+                    let client_endpoint = pairing::checked_endpoint(local.ip(), service_port)?;
                     let peer_id = config::generate_peer_id();
                     let long_term_psk = config::generate_pairing_psk();
                     let mut peer = config::PeerConfig::new(
                         peer_id.clone(),
-                        request.client_name.clone(),
+                        request.host_name.clone(),
                         host_endpoint,
                         client_endpoint,
-                        placement,
+                        opposite_placement(request.placement),
                         long_term_psk,
                     )?;
                     peer.persistent_permissions =
@@ -812,9 +812,9 @@ fn run_pair_host(
                     let grant = pairing::PairGrant {
                         peer_id,
                         psk: long_term_psk,
-                        host_name: bridge_config.local_name.clone(),
-                        host_service_port: service_port,
-                        placement,
+                        client_name: bridge_config.local_name.clone(),
+                        client_service_port: service_port,
+                        placement: request.placement,
                         persistent_permissions: peer.persistent_permissions,
                     };
                     // Send first, then commit locally. A client that cannot persist the grant
@@ -827,7 +827,7 @@ fn run_pair_host(
                 match result {
                     Ok(()) => {
                         println!(
-                            "paired one client; saved private configuration at {}",
+                            "paired one host; saved private configuration at {}",
                             config_path.display()
                         );
                         return Ok(());
@@ -853,11 +853,12 @@ fn run_pair_host(
     }
 }
 
-fn run_pair_join(
+fn run_pair_host(
     connect: SocketAddr,
     code: &str,
     config_override: Option<PathBuf>,
     local_name: String,
+    placement: config::RelativePlacement,
     service_port: u16,
     persistent_permissions: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -868,14 +869,15 @@ fn run_pair_join(
     }
     let temporary_psk = pairing::temporary_psk(code)?;
     let stream = TcpStream::connect_timeout(&connect, Duration::from_secs(10))?;
-    let host_ip = stream.peer_addr()?.ip();
-    let client_ip = stream.local_addr()?.ip();
+    let client_ip = stream.peer_addr()?.ip();
+    let host_ip = stream.local_addr()?.ip();
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut connection = SecureConnection::connect(stream, Role::Client, &temporary_psk)?;
+    let mut connection = SecureConnection::connect(stream, Role::Host, &temporary_psk)?;
     let request = pairing::PairRequest {
-        client_name: local_name.clone(),
-        client_service_port: service_port,
+        host_name: local_name.clone(),
+        host_service_port: service_port,
+        placement,
         persistent_permissions,
     };
     connection.send_payload(&pairing::encode_request(&request)?)?;
@@ -885,16 +887,16 @@ fn run_pair_join(
     bridge_config.local_name = local_name;
     let peer = config::PeerConfig::new(
         grant.peer_id,
-        grant.host_name,
-        pairing::checked_endpoint(host_ip, grant.host_service_port)?,
-        pairing::checked_endpoint(client_ip, service_port)?,
-        opposite_placement(grant.placement),
+        grant.client_name,
+        pairing::checked_endpoint(host_ip, service_port)?,
+        pairing::checked_endpoint(client_ip, grant.client_service_port)?,
+        grant.placement,
         grant.psk,
     )?;
     bridge_config.add_peer(peer)?;
     config::save(&path, &bridge_config)?;
     println!(
-        "paired host; saved private configuration at {}",
+        "paired client; saved private configuration at {}",
         path.display()
     );
     Ok(())
@@ -1530,18 +1532,18 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from([
                 "cachybridge",
-                "pair-host",
+                "pair-client",
                 "--code",
                 "ABCDE-FGHJK-LMNPQ-RSTUV-WXYZ2-3",
             ]),
             Ok(Cli {
-                command: Command::PairHost { .. }
+                command: Command::PairClient { .. }
             })
         ));
         assert!(matches!(
             Cli::try_parse_from([
                 "cachybridge",
-                "pair-join",
+                "pair-host",
                 "--connect",
                 "192.168.2.10:45232",
                 "--code",
@@ -1550,7 +1552,7 @@ mod tests {
                 "Client iMac",
             ]),
             Ok(Cli {
-                command: Command::PairJoin { .. }
+                command: Command::PairHost { .. }
             })
         ));
         assert!(matches!(

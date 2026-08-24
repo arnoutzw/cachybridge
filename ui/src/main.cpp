@@ -49,8 +49,9 @@ struct SetupDraft {
 
 struct PairJoinDraft {
     QString localName;
-    QString hostAddress;
+    QString clientAddress;
     QString code;
+    Placement placement = Placement::Left;
     bool persistentPermissions = false;
 };
 
@@ -59,9 +60,9 @@ public:
     virtual ~SetupStore() = default;
     virtual QString generatePairingToken(QString *error) = 0;
     virtual QString generatePairingCode(QString *error) = 0;
-    virtual QString startPairHost(const SetupDraft &draft, const QString &code,
-                                  QProcess *process) = 0;
-    virtual QString joinPairHost(const PairJoinDraft &draft) = 0;
+    virtual QString startPairClient(const SetupDraft &draft, const QString &code,
+                                    QProcess *process) = 0;
+    virtual QString connectPairHost(const PairJoinDraft &draft) = 0;
     virtual QString save(const SetupDraft &draft) = 0;
 };
 
@@ -119,13 +120,12 @@ public:
         return code;
     }
 
-    QString startPairHost(const SetupDraft &draft, const QString &code,
-                          QProcess *process) override {
+    QString startPairClient(const SetupDraft &draft, const QString &code,
+                            QProcess *process) override {
         QStringList arguments{
-            QStringLiteral("pair-host"), QStringLiteral("--listen"),
+            QStringLiteral("pair-client"), QStringLiteral("--listen"),
             QStringLiteral("0.0.0.0:45232"), QStringLiteral("--code"), code,
             QStringLiteral("--local-name"), draft.hostName,
-            QStringLiteral("--placement"), placementName(draft.placement),
         };
         if (!configPath_.isEmpty())
             arguments << QStringLiteral("--config") << configPath_;
@@ -137,11 +137,12 @@ public:
         return {};
     }
 
-    QString joinPairHost(const PairJoinDraft &draft) override {
+    QString connectPairHost(const PairJoinDraft &draft) override {
         QProcess process;
         QStringList arguments{
-            QStringLiteral("pair-join"), QStringLiteral("--connect"), draft.hostAddress,
+            QStringLiteral("pair-host"), QStringLiteral("--connect"), draft.clientAddress,
             QStringLiteral("--code"), draft.code, QStringLiteral("--local-name"), draft.localName,
+            QStringLiteral("--placement"), placementName(draft.placement),
         };
         if (!configPath_.isEmpty())
             arguments << QStringLiteral("--config") << configPath_;
@@ -219,8 +220,9 @@ public:
         heading->setFont(headingFont);
 
         auto *intro = new QLabel(QStringLiteral(
-            "Pair with a one-time code, then choose where the client display sits relative "
-            "to this host. No input portal is opened by this setup window."));
+            "On the controlled client, show a one-time code. On the input-owner host, "
+            "connect to that client and choose its relative display position. "
+            "No input portal is opened by this setup window."));
         intro->setWordWrap(true);
 
         hostName_ = new QLineEdit(QSysInfo::machineHostName());
@@ -236,7 +238,7 @@ public:
         pairingCode_->setPlaceholderText(QStringLiteral("ABCDE-FGHJK-MNPQR-STUVW-XYZ23-4"));
         pairingCode_->setMaxLength(31);
         pairingAddress_ = new QLineEdit;
-        pairingAddress_->setPlaceholderText(QStringLiteral("Host address, e.g. 192.168.2.226:45232"));
+        pairingAddress_->setPlaceholderText(QStringLiteral("Client address, e.g. 192.168.2.24:45232"));
 
         auto *generateSecret = new QPushButton(QStringLiteral("Generate token"));
         connect(generateSecret, &QPushButton::clicked, this, [this] {
@@ -268,9 +270,9 @@ public:
 
         auto *easyPairing = new QGroupBox(QStringLiteral("Easy one-time pairing (recommended)"));
         auto *easyLayout = new QVBoxLayout(easyPairing);
-        auto *hostButton = new QPushButton(QStringLiteral("Show one-time pairing code on this iMac"));
+        auto *hostButton = new QPushButton(QStringLiteral("Show one-time code on this client iMac"));
         hostButton->setToolTip(QStringLiteral(
-            "Starts a five-minute listener. On the other iMac, enter this iMac's LAN address and the displayed code."));
+            "Starts a five-minute listener. On the input-owner host, enter this client's LAN address and the displayed code."));
         connect(hostButton, &QPushButton::clicked, this, [this, hostButton] {
             if (hostPairingProcess_) {
                 QMessageBox::information(this, QStringLiteral("Pairing is already open"),
@@ -287,7 +289,7 @@ public:
                 clientName_->text().trimmed(), clientEndpoint_->text().trimmed(), QString(),
                 selectedPlacement(), persistent_->isChecked()};
             hostPairingProcess_ = new QProcess(this);
-            const QString startError = store_->startPairHost(draft, code, hostPairingProcess_);
+            const QString startError = store_->startPairClient(draft, code, hostPairingProcess_);
             if (!startError.isEmpty()) {
                 hostPairingProcess_->deleteLater();
                 hostPairingProcess_ = nullptr;
@@ -297,8 +299,8 @@ public:
             const QString address = localLanAddress();
             hostButton->setEnabled(false);
             QMessageBox::information(this, QStringLiteral("Pairing code — valid for five minutes"),
-                QStringLiteral("On the other iMac, choose ‘Join with a one-time code’ and enter:\n\n"
-                    "Host address: %1:45232\nCode: %2\n\nThis code works once and is not saved.")
+                QStringLiteral("On the input-owner host, choose ‘Connect host to client with code’ and enter:\n\n"
+                    "Client address: %1:45232\nCode: %2\n\nThis code works once and is not saved.")
                     .arg(address, code));
             connect(hostPairingProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this, hostButton](int exitCode, QProcess::ExitStatus status) {
@@ -308,31 +310,31 @@ public:
                     hostButton->setEnabled(true);
                     if (status == QProcess::NormalExit && exitCode == 0)
                         QMessageBox::information(this, QStringLiteral("Pairing complete"),
-                            QStringLiteral("The new peer was saved on this iMac with private permissions."));
+                            QStringLiteral("The input-owner host was saved on this client iMac with private permissions."));
                     else
                         QMessageBox::warning(this, QStringLiteral("Pairing ended"),
                             details.isEmpty() ? QStringLiteral("The code expired or pairing was not completed.") : details);
                 });
         });
-        auto *joinButton = new QPushButton(QStringLiteral("Join with a one-time code"));
+        auto *joinButton = new QPushButton(QStringLiteral("Connect host to client with code"));
         connect(joinButton, &QPushButton::clicked, this, [this] {
             const PairJoinDraft draft{hostName_->text().trimmed(), pairingAddress_->text().trimmed(),
-                pairingCode_->text().trimmed(), persistent_->isChecked()};
-            if (draft.localName.isEmpty() || draft.hostAddress.isEmpty() || draft.code.isEmpty()) {
+                pairingCode_->text().trimmed(), selectedPlacement(), persistent_->isChecked()};
+            if (draft.localName.isEmpty() || draft.clientAddress.isEmpty() || draft.code.isEmpty()) {
                 QMessageBox::warning(this, QStringLiteral("Pairing details needed"),
-                    QStringLiteral("Enter this iMac's name, the host address, and its displayed code."));
+                    QStringLiteral("Enter this host's name, the client address, and its displayed code."));
                 return;
             }
-            const QString error = store_->joinPairHost(draft);
+            const QString error = store_->connectPairHost(draft);
             if (!error.isEmpty()) {
                 QMessageBox::warning(this, QStringLiteral("Could not join"), error);
                 return;
             }
             QMessageBox::information(this, QStringLiteral("Pairing complete"),
-                QStringLiteral("The host was saved on this iMac with private permissions."));
+                QStringLiteral("The client was saved on this host iMac with private permissions."));
         });
         auto *joinForm = new QFormLayout;
-        joinForm->addRow(QStringLiteral("Host address"), pairingAddress_);
+        joinForm->addRow(QStringLiteral("Client address"), pairingAddress_);
         joinForm->addRow(QStringLiteral("One-time code"), pairingCode_);
         easyLayout->addWidget(hostButton);
         easyLayout->addLayout(joinForm);

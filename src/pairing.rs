@@ -35,8 +35,9 @@ pub enum PairingError {
 /// An endpoint advertised by the local peer during initial setup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairRequest {
-    pub client_name: String,
-    pub client_service_port: u16,
+    pub host_name: String,
+    pub host_service_port: u16,
+    pub placement: RelativePlacement,
     pub persistent_permissions: bool,
 }
 
@@ -44,8 +45,8 @@ pub struct PairRequest {
 pub struct PairGrant {
     pub peer_id: String,
     pub psk: [u8; 32],
-    pub host_name: String,
-    pub host_service_port: u16,
+    pub client_name: String,
+    pub client_service_port: u16,
     pub placement: RelativePlacement,
     pub persistent_permissions: bool,
 }
@@ -75,11 +76,9 @@ pub fn temporary_psk(code: &str) -> Result<[u8; 32], PairingError> {
 pub fn encode_request(request: &PairRequest) -> Result<Vec<u8>, PairingError> {
     encode_fields(&[
         ("kind", "request".to_owned()),
-        ("client_name", request.client_name.clone()),
-        (
-            "client_service_port",
-            request.client_service_port.to_string(),
-        ),
+        ("host_name", request.host_name.clone()),
+        ("host_service_port", request.host_service_port.to_string()),
+        ("placement", request.placement.as_str().to_owned()),
         (
             "persistent_permissions",
             request.persistent_permissions.to_string(),
@@ -91,8 +90,9 @@ pub fn decode_request(bytes: &[u8]) -> Result<PairRequest, PairingError> {
     let fields = decode_fields(bytes)?;
     require(&fields, "kind", "request")?;
     Ok(PairRequest {
-        client_name: value(&fields, "client_name")?.to_owned(),
-        client_service_port: parse_port(value(&fields, "client_service_port")?)?,
+        host_name: value(&fields, "host_name")?.to_owned(),
+        host_service_port: parse_port(value(&fields, "host_service_port")?)?,
+        placement: parse_placement(value(&fields, "placement")?)?,
         persistent_permissions: parse_bool(value(&fields, "persistent_permissions")?)?,
     })
 }
@@ -102,8 +102,8 @@ pub fn encode_grant(grant: &PairGrant) -> Result<Vec<u8>, PairingError> {
         ("kind", "grant".to_owned()),
         ("peer_id", grant.peer_id.clone()),
         ("psk", hex::encode(grant.psk)),
-        ("host_name", grant.host_name.clone()),
-        ("host_service_port", grant.host_service_port.to_string()),
+        ("client_name", grant.client_name.clone()),
+        ("client_service_port", grant.client_service_port.to_string()),
         ("placement", grant.placement.as_str().to_owned()),
         (
             "persistent_permissions",
@@ -123,15 +123,9 @@ pub fn decode_grant(bytes: &[u8]) -> Result<PairGrant, PairingError> {
     Ok(PairGrant {
         peer_id: value(&fields, "peer_id")?.to_owned(),
         psk,
-        host_name: value(&fields, "host_name")?.to_owned(),
-        host_service_port: parse_port(value(&fields, "host_service_port")?)?,
-        placement: match value(&fields, "placement")? {
-            "left" => RelativePlacement::Left,
-            "right" => RelativePlacement::Right,
-            "above" => RelativePlacement::Above,
-            "below" => RelativePlacement::Below,
-            _ => return Err(PairingError::InvalidMessage("invalid placement")),
-        },
+        client_name: value(&fields, "client_name")?.to_owned(),
+        client_service_port: parse_port(value(&fields, "client_service_port")?)?,
+        placement: parse_placement(value(&fields, "placement")?)?,
         persistent_permissions: parse_bool(value(&fields, "persistent_permissions")?)?,
     })
 }
@@ -287,13 +281,19 @@ fn parse_bool(value: &str) -> Result<bool, PairingError> {
         .map_err(|_| PairingError::InvalidMessage("invalid boolean"))
 }
 
+fn parse_placement(value: &str) -> Result<RelativePlacement, PairingError> {
+    match value {
+        "left" => Ok(RelativePlacement::Left),
+        "right" => Ok(RelativePlacement::Right),
+        "above" => Ok(RelativePlacement::Above),
+        "below" => Ok(RelativePlacement::Below),
+        _ => Err(PairingError::InvalidMessage("invalid placement")),
+    }
+}
+
 impl fmt::Display for PairRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{}:{}",
-            self.client_name, self.client_service_port
-        )
+        write!(formatter, "{}:{}", self.host_name, self.host_service_port)
     }
 }
 
@@ -321,8 +321,8 @@ mod tests {
         let grant = PairGrant {
             peer_id: "a".repeat(32),
             psk: [7; 32],
-            host_name: "Host iMac".into(),
-            host_service_port: 45_231,
+            client_name: "Client iMac".into(),
+            client_service_port: 45_231,
             placement: RelativePlacement::Left,
             persistent_permissions: true,
         };
