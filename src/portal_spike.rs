@@ -242,7 +242,7 @@ impl InputCaptureSession {
 
     /// Read a bounded batch of typed libei input events.
     pub fn dispatch_events(&mut self, timeout: Duration) -> io::Result<DispatchBatch> {
-        self.receiver.dispatch(timeout)
+        self.receiver.dispatch_input(timeout)
     }
 
     pub fn receiver_mut(&mut self) -> &mut Receiver {

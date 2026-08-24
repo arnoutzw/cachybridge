@@ -2,9 +2,11 @@
 
 use thiserror::Error;
 
-/// Version 3 adds authenticated client-to-host `ExitRequest` control frames.
+/// Version 4 adds atomic two-axis pointer-motion frames. This prevents the
+/// controlled compositor from rendering diagonal motion as separate horizontal
+/// and vertical updates.
 /// Older handoff implementations fail closed during decoding.
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 pub const MAX_FRAME_PAYLOAD: usize = 64;
 pub const MAX_PLAINTEXT_FRAME: usize = 4 + MAX_FRAME_PAYLOAD;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
@@ -19,6 +21,7 @@ const KIND_ENTER_ACK: u8 = 6;
 const KIND_ENTER_REJECTED: u8 = 7;
 const KIND_HANDOFF_RELEASE: u8 = 8;
 const KIND_EXIT_REQUEST: u8 = 9;
+const KIND_POINTER_MOTION: u8 = 10;
 const INPUT_PAYLOAD_LEN: usize = 8;
 const ENTER_PAYLOAD_LEN: usize = 8;
 const EXIT_REQUEST_PAYLOAD_LEN: usize = 9;
@@ -67,6 +70,12 @@ pub enum Message {
         edge: WireEdge,
         x: i32,
         y: i32,
+    },
+    /// A coalesced relative pointer sample. Unlike evdev REL_X/REL_Y records,
+    /// the two axes are injected in one EIS frame on the controlled desktop.
+    PointerMotion {
+        dx: i32,
+        dy: i32,
     },
 }
 
@@ -118,6 +127,12 @@ pub fn encode_frame(message: Message) -> Vec<u8> {
             payload[1..5].copy_from_slice(&x.to_be_bytes());
             payload[5..].copy_from_slice(&y.to_be_bytes());
             (KIND_EXIT_REQUEST, payload.to_vec())
+        }
+        Message::PointerMotion { dx, dy } => {
+            let mut payload = [0_u8; 8];
+            payload[..4].copy_from_slice(&dx.to_be_bytes());
+            payload[4..].copy_from_slice(&dy.to_be_bytes());
+            (KIND_POINTER_MOTION, payload.to_vec())
         }
     };
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -178,13 +193,16 @@ pub fn decode_frame(frame: &[u8]) -> Result<Message, ProtocolError> {
                 y: i32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]),
             })
         }
+        KIND_POINTER_MOTION if payload.len() == 8 => Ok(Message::PointerMotion {
+            dx: i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            dy: i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        }),
         KIND_INPUT | KIND_HEARTBEAT | KIND_RELEASE_ALL | KIND_GOODBYE | KIND_ENTER
-        | KIND_ENTER_ACK | KIND_ENTER_REJECTED | KIND_HANDOFF_RELEASE | KIND_EXIT_REQUEST => {
-            Err(ProtocolError::InvalidPayloadLength {
-                kind,
-                actual: payload.len(),
-            })
-        }
+        | KIND_ENTER_ACK | KIND_ENTER_REJECTED | KIND_HANDOFF_RELEASE | KIND_EXIT_REQUEST
+        | KIND_POINTER_MOTION => Err(ProtocolError::InvalidPayloadLength {
+            kind,
+            actual: payload.len(),
+        }),
         _ => Err(ProtocolError::UnknownKind(kind)),
     }
 }
@@ -206,8 +224,8 @@ mod tests {
     #[test]
     fn rejects_future_version() {
         assert_eq!(
-            decode_frame(&[4, KIND_HEARTBEAT, 0, 0]),
-            Err(ProtocolError::UnsupportedVersion(4))
+            decode_frame(&[5, KIND_HEARTBEAT, 0, 0]),
+            Err(ProtocolError::UnsupportedVersion(5))
         );
     }
 
@@ -231,6 +249,7 @@ mod tests {
                 x: -1,
                 y: 612,
             },
+            Message::PointerMotion { dx: 8, dy: -5 },
         ] {
             assert_eq!(decode_frame(&encode_frame(message)), Ok(message));
         }

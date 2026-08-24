@@ -258,6 +258,21 @@ impl Receiver {
 
     /// Dispatch available protocol messages into owned metadata and input events.
     pub fn dispatch(&mut self, timeout: Duration) -> io::Result<DispatchBatch> {
+        self.dispatch_inner(timeout, true)
+    }
+
+    /// Hot-path dispatch for input forwarding. It deliberately avoids
+    /// allocating diagnostic event-name strings or retaining an unbounded
+    /// event history for every mouse update.
+    pub fn dispatch_input(&mut self, timeout: Duration) -> io::Result<DispatchBatch> {
+        self.dispatch_inner(timeout, false)
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        timeout: Duration,
+        record_event_names: bool,
+    ) -> io::Result<DispatchBatch> {
         let timeout_ms = duration_to_poll_ms(timeout);
         let mut poll_fd = PollFd {
             fd: unsafe { ei_get_fd(self.context.as_ptr()) },
@@ -275,10 +290,12 @@ impl Receiver {
         let mut batch = DispatchBatch::default();
         while let Some(event) = NonNull::new(unsafe { ei_get_event(self.context.as_ptr()) }) {
             let event_type = unsafe { ei_event_get_type(event.as_ptr()) };
-            let event_name = event_type_name(event_type);
-            self.metadata.event_types.push(event_name.clone());
-            batch.event_types.push(event_name);
-            self.process_metadata_event(event.as_ptr(), event_type);
+            if record_event_names {
+                let event_name = event_type_name(event_type);
+                self.metadata.event_types.push(event_name.clone());
+                batch.event_types.push(event_name);
+            }
+            self.process_metadata_event(event.as_ptr(), event_type, record_event_names);
             let decoded = decode_input_event(event.as_ptr(), event_type);
             unsafe { ei_event_unref(event.as_ptr()) };
             if let Some(input) = decoded? {
@@ -288,7 +305,12 @@ impl Receiver {
         Ok(batch)
     }
 
-    fn process_metadata_event(&mut self, event: *mut EiEvent, event_type: c_int) {
+    fn process_metadata_event(
+        &mut self,
+        event: *mut EiEvent,
+        event_type: c_int,
+        record_event_names: bool,
+    ) {
         match event_type {
             EI_EVENT_CONNECT => self.metadata.connected = true,
             EI_EVENT_DISCONNECT => self.metadata.disconnected = true,
@@ -351,7 +373,7 @@ impl Receiver {
                     regions,
                 });
             }
-            EI_EVENT_DEVICE_START_EMULATING => {
+            EI_EVENT_DEVICE_START_EMULATING if record_event_names => {
                 let sequence = unsafe { ei_event_emulating_get_sequence(event) };
                 if let Some(last) = self.metadata.event_types.last_mut() {
                     last.push_str(&format!("(sequence={sequence})"));

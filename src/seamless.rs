@@ -37,7 +37,15 @@ pub struct InputCaptureAdapter {
     /// scrolling stay ordered and uncoalesced; pointer motion is safe to
     /// batch and avoids a burst of individually framed network packets.
     pending_motion: (i32, i32),
-    pending: VecDeque<WireInputEvent>,
+    pending: VecDeque<CapturedInput>,
+}
+
+/// Typed input leaving the portal capture adapter. Pointer motion has its own
+/// paired form so a diagonal source update remains a single remote EIS frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapturedInput {
+    Motion { dx: i32, dy: i32 },
+    Event(WireInputEvent),
 }
 
 /// Watches the controlled client's right InputCapture barrier. It is separate
@@ -212,7 +220,9 @@ impl InputCaptureAdapter {
 
     fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_motion);
-        self.pending.extend(relative_wire_events(dx, dy));
+        if dx != 0 || dy != 0 {
+            self.pending.push_back(CapturedInput::Motion { dx, dy });
+        }
     }
 
     fn drain_batch(&mut self, batch: crate::libei_capture::DispatchBatch) -> io::Result<()> {
@@ -233,7 +243,11 @@ impl InputCaptureAdapter {
                 }
                 event => {
                     self.flush_motion();
-                    self.pending.extend(captured_to_wire(event)?);
+                    self.pending.extend(
+                        captured_to_wire(event)?
+                            .into_iter()
+                            .map(CapturedInput::Event),
+                    );
                 }
             }
         }
@@ -296,7 +310,7 @@ impl CaptureBackend for InputCaptureAdapter {
         }
     }
 
-    fn next_input(&mut self, timeout: Duration) -> io::Result<Option<WireInputEvent>> {
+    fn next_input(&mut self, timeout: Duration) -> io::Result<Option<CapturedInput>> {
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
         }
@@ -499,6 +513,10 @@ impl InjectBackend for RemoteDesktopInjector {
         Ok(())
     }
 
+    fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()> {
+        self.session.inject_relative(f64::from(dx), f64::from(dy))
+    }
+
     fn inject(&mut self, event: WireInputEvent) -> io::Result<()> {
         const EV_SYN: u16 = 0;
         const EV_KEY: u16 = 1;
@@ -549,7 +567,7 @@ pub trait CaptureBackend {
     fn begin_remote_input(&mut self) -> io::Result<()>;
     /// Returns the next safely decoded input event. The implementation may use
     /// `None` for a heartbeat interval with no input.
-    fn next_input(&mut self, timeout: Duration) -> io::Result<Option<WireInputEvent>>;
+    fn next_input(&mut self, timeout: Duration) -> io::Result<Option<CapturedInput>>;
     /// Releases the active portal capture at `restore` and leaves the edge
     /// armed for a later handoff.
     fn return_to_local(&mut self, restore: Point) -> io::Result<()>;
@@ -562,6 +580,8 @@ pub trait CaptureBackend {
 pub trait InjectBackend {
     /// Prepares virtual pointer/input state for an accepted peer entry.
     fn prepare_entry(&mut self, entry: Point) -> io::Result<()>;
+    /// Inject one paired relative motion update in exactly one remote frame.
+    fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()>;
     fn inject(&mut self, event: WireInputEvent) -> io::Result<()>;
     /// Synthesizes releases for all pressed keys/buttons and closes the active
     /// injection scope. It must be safe to call more than once.
@@ -659,11 +679,16 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
 
     /// Forwards one event only while the controller owns a remote-active
     /// handoff. Call this repeatedly from the portal/libei dispatch loop.
-    pub fn forward(&mut self, event: WireInputEvent) -> Result<(), SeamlessError> {
+    pub fn forward(&mut self, input: CapturedInput) -> Result<(), SeamlessError> {
         if !matches!(self.controller.state(), HandoffState::RemoteActive { .. }) {
             return Err(SeamlessError::InputBeforeAcknowledgement);
         }
-        self.transport.send(Message::Input(event))?;
+        match input {
+            CapturedInput::Motion { dx, dy } => {
+                self.transport.send(Message::PointerMotion { dx, dy })?
+            }
+            CapturedInput::Event(event) => self.transport.send(Message::Input(event))?,
+        }
         Ok(())
     }
 
@@ -676,12 +701,12 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
             return Ok(());
         }
         match self.capture.next_input(timeout)? {
-            Some(event) => {
+            Some(input) => {
                 // An ExitRequest may have arrived while EIS dispatch waited.
                 // Check again before emitting another remote input event.
                 self.poll_control()?;
                 if matches!(self.controller.state(), HandoffState::RemoteActive { .. }) {
-                    self.forward(event)
+                    self.forward(input)
                 } else {
                     Ok(())
                 }
@@ -813,6 +838,10 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 self.injector.inject(event)?;
                 Ok(())
             }
+            Message::PointerMotion { dx, dy } if self.remote_active => {
+                self.injector.inject_motion(dx, dy)?;
+                Ok(())
+            }
             Message::Input(_) => {
                 if self.return_pending {
                     // The host may have selected this input before receiving
@@ -823,6 +852,14 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 }
                 let _ = self.close();
                 Err(SeamlessError::InputBeforeEntry)
+            }
+            Message::PointerMotion { .. } => {
+                if self.return_pending {
+                    Ok(())
+                } else {
+                    let _ = self.close();
+                    Err(SeamlessError::InputBeforeEntry)
+                }
             }
             Message::Heartbeat => Ok(()),
             Message::HandoffRelease => {
@@ -878,7 +915,7 @@ mod tests {
         began: bool,
         released: usize,
         restores: Vec<Option<Point>>,
-        inputs: VecDeque<Option<WireInputEvent>>,
+        inputs: VecDeque<Option<CapturedInput>>,
     }
 
     impl CaptureBackend for FakeCapture {
@@ -893,7 +930,7 @@ mod tests {
             Ok(())
         }
 
-        fn next_input(&mut self, _: Duration) -> io::Result<Option<WireInputEvent>> {
+        fn next_input(&mut self, _: Duration) -> io::Result<Option<CapturedInput>> {
             Ok(self.inputs.pop_front().flatten())
         }
 
@@ -913,6 +950,7 @@ mod tests {
     #[derive(Default)]
     struct FakeInject {
         prepared: Vec<Point>,
+        motions: Vec<(i32, i32)>,
         inputs: Vec<WireInputEvent>,
         releases: usize,
     }
@@ -920,6 +958,11 @@ mod tests {
     impl InjectBackend for FakeInject {
         fn prepare_entry(&mut self, entry: Point) -> io::Result<()> {
             self.prepared.push(entry);
+            Ok(())
+        }
+
+        fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()> {
+            self.motions.push((dx, dy));
             Ok(())
         }
 
@@ -1046,11 +1089,11 @@ mod tests {
         host.activate_once().unwrap();
         assert_eq!(host.state(), HandoffState::Local);
         assert!(matches!(
-            host.forward(WireInputEvent {
+            host.forward(CapturedInput::Event(WireInputEvent {
                 event_type: 1,
                 code: 30,
                 value: 1
-            }),
+            })),
             Err(SeamlessError::InputBeforeAcknowledgement)
         ));
         let (capture, _) = host.into_parts();
@@ -1116,9 +1159,13 @@ mod tests {
                 value: 1,
             }))
             .unwrap();
+        client
+            .handle(Message::PointerMotion { dx: 7, dy: -4 })
+            .unwrap();
         client.handle(Message::HandoffRelease).unwrap();
         let (injector, transport) = client.into_parts();
         assert_eq!(injector.prepared, vec![Point { x: -1, y: 500 }]);
+        assert_eq!(injector.motions, vec![(7, -4)]);
         assert_eq!(injector.inputs.len(), 1);
         assert_eq!(injector.releases, 1);
         assert_eq!(transport.sent, vec![Message::EnterAck]);

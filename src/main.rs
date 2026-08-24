@@ -1183,6 +1183,12 @@ fn run_client(
                     "manual client received a seamless-only exit request",
                 )));
             }
+            Ok(Message::PointerMotion { .. }) => {
+                break Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manual client received a seamless-only paired motion frame",
+                )));
+            }
             Ok(Message::Goodbye) => break Ok(()),
             Err(TransportError::Io(error))
                 if matches!(
