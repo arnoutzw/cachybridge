@@ -373,15 +373,12 @@ public:
     }
 
     QString ensureClientFirewall() override {
-        const QString ufw = QStandardPaths::findExecutable(QStringLiteral("ufw"));
+        QString ufw = QStandardPaths::findExecutable(QStringLiteral("ufw"));
+        if (ufw.isEmpty() && QFileInfo::exists(QStringLiteral("/usr/bin/ufw")))
+            ufw = QStringLiteral("/usr/bin/ufw");
+        if (ufw.isEmpty() && QFileInfo::exists(QStringLiteral("/usr/sbin/ufw")))
+            ufw = QStringLiteral("/usr/sbin/ufw");
         if (ufw.isEmpty()) return {};
-        QProcess status;
-        status.start(ufw, {QStringLiteral("status")});
-        if (!status.waitForStarted() || !status.waitForFinished(5000)
-            || status.exitStatus() != QProcess::NormalExit || status.exitCode() != 0)
-            return QStringLiteral("Could not determine the local firewall state.");
-        if (!QString::fromUtf8(status.readAllStandardOutput()).contains(QStringLiteral("Status: active")))
-            return {};
         const QString subnet = detectedLanCidr();
         if (subnet.isEmpty())
             return QStringLiteral("Could not determine this iMac's local IPv4 subnet for the firewall rule.");
