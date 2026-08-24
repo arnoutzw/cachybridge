@@ -1,10 +1,12 @@
 //! Clipboard synchronization over an already authenticated CachyBridge transport.
 //! Contents never touch discovery, logs, or configuration files. It supports
-//! normal text and common image data, but deliberately excludes file/URI data.
+//! normal text, common image data, and bounded regular-file transfers.
 
 use std::{
+    collections::HashSet,
+    fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -28,8 +30,14 @@ const CHUNK_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 4;
 // image transfers cannot deadlock at a partial frame boundary.
 const MAX_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum aggregate size of one regular-file clipboard transfer. File data is
+/// transmitted in-memory, so this is intentionally bounded separately from
+/// image/text clipboard content.
+const MAX_FILE_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(10);
+const FILE_TRANSFER_MIME: &str = "application/x-cachybridge-file-list";
+const FILE_BUNDLE_PREFIX: &[u8] = b"CBFL1";
 
 const SUPPORTED_MIME_TYPES: &[&str] = &[
     "text/plain",
@@ -37,6 +45,7 @@ const SUPPORTED_MIME_TYPES: &[&str] = &[
     "image/png",
     "image/jpeg",
     "image/webp",
+    FILE_TRANSFER_MIME,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,18 +62,28 @@ struct IncomingTransfer {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileEntry {
+    name: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum ClipboardError {
     #[error("clipboard synchronization requires wl-clipboard (install the wl-clipboard package)")]
     MissingTool,
     #[error("clipboard command failed: {0}")]
     Command(String),
-    #[error("clipboard item exceeds {MAX_CLIPBOARD_BYTES} bytes")]
+    #[error("clipboard item exceeds its supported size limit")]
     TooLarge,
     #[error("clipboard MIME type is not supported")]
     UnsupportedMime,
     #[error("clipboard data is not valid UTF-8 text")]
     NonText,
+    #[error("clipboard file list contains no supported regular files")]
+    NoRegularFiles,
+    #[error("clipboard file transfer has an invalid bundle")]
+    InvalidFileBundle,
     #[error("invalid encrypted clipboard record")]
     InvalidRecord,
     #[error("clipboard transport error: {0}")]
@@ -260,8 +279,28 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
         return Ok(None);
     }
     let type_list = String::from_utf8(types.stdout).map_err(|_| ClipboardError::InvalidRecord)?;
+    if type_list
+        .lines()
+        .any(|available| available == "text/uri-list")
+    {
+        let output = Command::new(clipboard_tool("wl-paste"))
+            .args(["--no-newline", "--type", "text/uri-list"])
+            .output()
+            .map_err(map_command_start)?;
+        if output.status.success() {
+            match pack_local_files(&output.stdout) {
+                Ok(content) => return Ok(Some(content)),
+                // A URI list can also be a browser URL drag or a directory.
+                // Leave those local rather than ending the whole clipboard
+                // session because they are not safe portable file copies.
+                Err(ClipboardError::NoRegularFiles) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let Some(mime_type) = SUPPORTED_MIME_TYPES
         .iter()
+        .filter(|candidate| **candidate != FILE_TRANSFER_MIME)
         .find(|candidate| type_list.lines().any(|available| available == **candidate))
     else {
         return Ok(None);
@@ -295,13 +334,21 @@ fn write_content(
 ) -> Result<(), ClipboardError> {
     validate_content(content)?;
     stop_provider(provider);
+    let (mime_type, bytes) = if content.mime_type == FILE_TRANSFER_MIME {
+        (
+            "text/uri-list".to_owned(),
+            materialize_files(&content.bytes)?,
+        )
+    } else {
+        (content.mime_type.clone(), content.bytes.clone())
+    };
     let mut child = Command::new(clipboard_tool("wl-copy"))
         // wl-copy normally forks into a clipboard-provider daemon. Waiting for
         // the initial process can therefore block forever under systemd's
         // subreaper, which froze our receive loop after its first update. Keep
         // it in the foreground and return to the sync loop immediately. Its
         // child handle is retained so the next replacement can retire it.
-        .args(["--foreground", "--type", &content.mime_type])
+        .args(["--foreground", "--type", &mime_type])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -311,7 +358,7 @@ fn write_content(
         .stdin
         .take()
         .ok_or_else(|| ClipboardError::Command("wl-copy did not accept stdin".to_owned()))?;
-    stdin.write_all(&content.bytes)?;
+    stdin.write_all(&bytes)?;
     // Closing stdin tells wl-copy that it has received the complete item.
     drop(stdin);
     *provider = Some(child);
@@ -335,9 +382,280 @@ fn stop_provider(provider: &mut Option<std::process::Child>) {
     }
 }
 
+fn pack_local_files(uri_list: &[u8]) -> Result<ClipboardContent, ClipboardError> {
+    let uri_list = std::str::from_utf8(uri_list).map_err(|_| ClipboardError::InvalidFileBundle)?;
+    let mut files = Vec::new();
+    let mut names = HashSet::new();
+    let mut total_bytes = 0_usize;
+    for line in uri_list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let path = file_uri_to_path(line)?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => continue,
+        };
+        let size = usize::try_from(metadata.len()).map_err(|_| ClipboardError::TooLarge)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or(ClipboardError::TooLarge)?;
+        if total_bytes > MAX_FILE_TRANSFER_BYTES {
+            return Err(ClipboardError::TooLarge);
+        }
+        let name = safe_file_name(&path)?;
+        if !names.insert(name.clone()) {
+            // A URI list can contain files named alike from different folders.
+            // Refuse that ambiguity instead of silently overwriting one peer's
+            // file on the other iMac.
+            return Err(ClipboardError::InvalidFileBundle);
+        }
+        files.push(FileEntry {
+            name,
+            bytes: fs::read(path)?,
+        });
+    }
+    if files.is_empty() {
+        return Err(ClipboardError::NoRegularFiles);
+    }
+    let content = ClipboardContent {
+        mime_type: FILE_TRANSFER_MIME.to_owned(),
+        bytes: encode_file_bundle(&files)?,
+    };
+    validate_content(&content)?;
+    Ok(content)
+}
+
+fn file_uri_to_path(uri: &str) -> Result<PathBuf, ClipboardError> {
+    let Some(remainder) = uri.strip_prefix("file://") else {
+        return Err(ClipboardError::NoRegularFiles);
+    };
+    let path = if remainder.starts_with('/') {
+        remainder.to_owned()
+    } else if let Some(path) = remainder.strip_prefix("localhost/") {
+        format!("/{path}")
+    } else {
+        return Err(ClipboardError::NoRegularFiles);
+    };
+    let decoded = percent_decode(&path)?;
+    if !decoded.starts_with('/') || decoded.contains('\0') {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    Ok(PathBuf::from(decoded))
+}
+
+fn percent_decode(value: &str) -> Result<String, ClipboardError> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let source = value.as_bytes();
+    let mut index = 0;
+    while index < source.len() {
+        if source[index] == b'%' {
+            if index + 2 >= source.len() {
+                return Err(ClipboardError::InvalidFileBundle);
+            }
+            let nibble = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            let high = nibble(source[index + 1]).ok_or(ClipboardError::InvalidFileBundle)?;
+            let low = nibble(source[index + 2]).ok_or(ClipboardError::InvalidFileBundle)?;
+            bytes.push((high << 4) | low);
+            index += 3;
+        } else {
+            bytes.push(source[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| ClipboardError::InvalidFileBundle)
+}
+
+fn safe_file_name(path: &Path) -> Result<String, ClipboardError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .ok_or(ClipboardError::InvalidFileBundle)?;
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    Ok(name.to_owned())
+}
+
+fn encode_file_bundle(files: &[FileEntry]) -> Result<Vec<u8>, ClipboardError> {
+    if files.is_empty() || files.len() > u16::MAX as usize {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    let mut total_bytes = 0_usize;
+    let mut output = Vec::from(FILE_BUNDLE_PREFIX);
+    output.extend_from_slice(&(files.len() as u16).to_be_bytes());
+    for file in files {
+        if file.name.is_empty()
+            || file.name.len() > u16::MAX as usize
+            || file.name.contains('/')
+            || file.name.contains('\\')
+            || file.name == "."
+            || file.name == ".."
+        {
+            return Err(ClipboardError::InvalidFileBundle);
+        }
+        total_bytes = total_bytes
+            .checked_add(file.bytes.len())
+            .ok_or(ClipboardError::TooLarge)?;
+        if total_bytes > MAX_FILE_TRANSFER_BYTES {
+            return Err(ClipboardError::TooLarge);
+        }
+        output.extend_from_slice(&(file.name.len() as u16).to_be_bytes());
+        output.extend_from_slice(&(file.bytes.len() as u64).to_be_bytes());
+        output.extend_from_slice(file.name.as_bytes());
+        output.extend_from_slice(&file.bytes);
+    }
+    Ok(output)
+}
+
+fn decode_file_bundle(bundle: &[u8]) -> Result<Vec<FileEntry>, ClipboardError> {
+    let mut input = bundle
+        .strip_prefix(FILE_BUNDLE_PREFIX)
+        .ok_or(ClipboardError::InvalidFileBundle)?;
+    if input.len() < 2 {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    let count = u16::from_be_bytes(input[..2].try_into().expect("fixed width")) as usize;
+    input = &input[2..];
+    if count == 0 {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    let mut files = Vec::with_capacity(count);
+    let mut names = HashSet::new();
+    let mut total_bytes = 0_usize;
+    for _ in 0..count {
+        if input.len() < 10 {
+            return Err(ClipboardError::InvalidFileBundle);
+        }
+        let name_len = u16::from_be_bytes(input[..2].try_into().expect("fixed width")) as usize;
+        let size = u64::from_be_bytes(input[2..10].try_into().expect("fixed width"));
+        let size = usize::try_from(size).map_err(|_| ClipboardError::TooLarge)?;
+        input = &input[10..];
+        if name_len == 0 || input.len() < name_len || input.len() - name_len < size {
+            return Err(ClipboardError::InvalidFileBundle);
+        }
+        let name = std::str::from_utf8(&input[..name_len])
+            .map_err(|_| ClipboardError::InvalidFileBundle)?
+            .to_owned();
+        if name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+            || !names.insert(name.clone())
+        {
+            return Err(ClipboardError::InvalidFileBundle);
+        }
+        input = &input[name_len..];
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or(ClipboardError::TooLarge)?;
+        if total_bytes > MAX_FILE_TRANSFER_BYTES {
+            return Err(ClipboardError::TooLarge);
+        }
+        files.push(FileEntry {
+            name,
+            bytes: input[..size].to_vec(),
+        });
+        input = &input[size..];
+    }
+    if !input.is_empty() {
+        return Err(ClipboardError::InvalidFileBundle);
+    }
+    Ok(files)
+}
+
+fn materialize_files(bundle: &[u8]) -> Result<Vec<u8>, ClipboardError> {
+    let files = decode_file_bundle(bundle)?;
+    let parent = received_files_root()?;
+    let mut random = [0_u8; 12];
+    rand::thread_rng().fill_bytes(&mut random);
+    let directory = parent.join(hex::encode(random));
+    fs::create_dir(&directory)?;
+    set_private_directory(&directory)?;
+    let mut uris = String::new();
+    for file in files {
+        let path = directory.join(&file.name);
+        write_private_file(&path, &file.bytes)?;
+        uris.push_str("file://");
+        uris.push_str(&percent_encode_path(&path)?);
+        uris.push('\n');
+    }
+    Ok(uris.into_bytes())
+}
+
+fn received_files_root() -> Result<PathBuf, ClipboardError> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or_else(|| {
+            ClipboardError::Command("could not determine a private data directory".to_owned())
+        })?;
+    let directory = base.join("cachybridge").join("received-files");
+    fs::create_dir_all(&directory)?;
+    set_private_directory(&directory)?;
+    Ok(directory)
+}
+
+fn percent_encode_path(path: &Path) -> Result<String, ClipboardError> {
+    let value = path.to_str().ok_or(ClipboardError::InvalidFileBundle)?;
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~')
+        {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    Ok(encoded)
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<(), ClipboardError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_: &Path) -> Result<(), ClipboardError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClipboardError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClipboardError> {
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn validate_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
     validate_mime(&content.mime_type)?;
-    if content.bytes.len() > MAX_CLIPBOARD_BYTES {
+    let limit = if content.mime_type == FILE_TRANSFER_MIME {
+        MAX_FILE_TRANSFER_BYTES
+    } else {
+        MAX_CLIPBOARD_BYTES
+    };
+    if content.bytes.len() > limit {
         return Err(ClipboardError::TooLarge);
     }
     if content.mime_type.starts_with("text/") {
@@ -438,6 +756,57 @@ mod tests {
         assert!(matches!(
             decode_chunk(&[0_u8; 12]),
             Err(ClipboardError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn file_bundle_round_trips_multiple_regular_files() {
+        let files = vec![
+            FileEntry {
+                name: "notes.txt".to_owned(),
+                bytes: b"hello".to_vec(),
+            },
+            FileEntry {
+                name: "diagram.png".to_owned(),
+                bytes: vec![1, 2, 3, 4],
+            },
+        ];
+        let bundle = encode_file_bundle(&files).unwrap();
+        assert_eq!(decode_file_bundle(&bundle).unwrap(), files);
+    }
+
+    #[test]
+    fn file_bundle_rejects_path_traversal_and_duplicate_names() {
+        assert!(matches!(
+            encode_file_bundle(&[FileEntry {
+                name: "../escape".to_owned(),
+                bytes: vec![1],
+            }]),
+            Err(ClipboardError::InvalidFileBundle)
+        ));
+        let mut malformed = Vec::from(FILE_BUNDLE_PREFIX);
+        malformed.extend_from_slice(&2_u16.to_be_bytes());
+        for bytes in [b"first".as_slice(), b"second".as_slice()] {
+            malformed.extend_from_slice(&8_u16.to_be_bytes());
+            malformed.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            malformed.extend_from_slice(b"same.txt");
+            malformed.extend_from_slice(bytes);
+        }
+        assert!(matches!(
+            decode_file_bundle(&malformed),
+            Err(ClipboardError::InvalidFileBundle)
+        ));
+    }
+
+    #[test]
+    fn file_uris_decode_only_local_paths() {
+        assert_eq!(
+            file_uri_to_path("file:///tmp/a%20file.txt").unwrap(),
+            PathBuf::from("/tmp/a file.txt")
+        );
+        assert!(matches!(
+            file_uri_to_path("https://example.com/file.txt"),
+            Err(ClipboardError::NoRegularFiles)
         ));
     }
 }
