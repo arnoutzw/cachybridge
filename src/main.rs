@@ -1,8 +1,9 @@
 //! CachyBridge demo executable.
 //!
 //! This is deliberately a point-to-point demo: the client listens, one host
-//! connects, and encrypted input events are injected on the client. It has no
-//! discovery, clipboard, or edge-handoff logic yet.
+//! connects, and encrypted input events are injected on the client. The
+//! current implementation also includes paired topology, clipboard, and
+//! edge-handoff support.
 
 mod clipboard;
 pub mod config;
