@@ -1847,6 +1847,12 @@ fn run_client(
                     "manual client received a seamless-only paired motion frame",
                 )));
             }
+            Ok(Message::Touch(_)) => {
+                break Err(Box::new(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manual client received a seamless-only touch frame",
+                )));
+            }
             Ok(Message::Goodbye) => break Ok(()),
             Err(TransportError::Io(error))
                 if matches!(

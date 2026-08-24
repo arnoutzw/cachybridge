@@ -5,7 +5,7 @@
 //! for safe release during disconnect or cleanup.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::{c_char, c_int, c_short, c_void, CStr, CString},
     io,
     os::fd::{IntoRawFd, OwnedFd},
@@ -63,6 +63,11 @@ struct EiRegion {
 }
 
 #[repr(C)]
+struct EiTouch {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 struct PollFd {
     fd: c_int,
     events: c_short,
@@ -106,6 +111,12 @@ unsafe extern "C" {
     fn ei_device_scroll_discrete(device: *mut EiDevice, x: i32, y: i32);
     fn ei_device_scroll_stop(device: *mut EiDevice, stop_x: bool, stop_y: bool);
     fn ei_device_keyboard_key(device: *mut EiDevice, keycode: u32, is_press: bool);
+    fn ei_device_touch_new(device: *mut EiDevice) -> *mut EiTouch;
+    fn ei_touch_down(touch: *mut EiTouch, x: f64, y: f64);
+    fn ei_touch_motion(touch: *mut EiTouch, x: f64, y: f64);
+    fn ei_touch_up(touch: *mut EiTouch);
+    fn ei_touch_cancel(touch: *mut EiTouch);
+    fn ei_touch_unref(touch: *mut EiTouch) -> *mut EiTouch;
 
     fn ei_region_get_x(region: *mut EiRegion) -> u32;
     fn ei_region_get_y(region: *mut EiRegion) -> u32;
@@ -133,10 +144,12 @@ pub struct Sender {
     keyboard: Option<NonNull<EiDevice>>,
     button: Option<NonNull<EiDevice>>,
     scroll: Option<NonNull<EiDevice>>,
+    touch: Option<NonNull<EiDevice>>,
     resumed: Vec<NonNull<EiDevice>>,
     emulating: Vec<NonNull<EiDevice>>,
     pressed_keys: BTreeSet<u16>,
     pressed_buttons: BTreeSet<u16>,
+    touches: BTreeMap<u32, NonNull<EiTouch>>,
     sequence: u32,
     metadata: ReceiverMetadata,
 }
@@ -161,10 +174,12 @@ impl Sender {
             keyboard: None,
             button: None,
             scroll: None,
+            touch: None,
             resumed: Vec::new(),
             emulating: Vec::new(),
             pressed_keys: BTreeSet::new(),
             pressed_buttons: BTreeSet::new(),
+            touches: BTreeMap::new(),
             sequence: 0,
             metadata: ReceiverMetadata::default(),
         })
@@ -173,7 +188,9 @@ impl Sender {
     /// Complete the sender handshake and wait for resumed pointer and keyboard devices.
     pub fn handshake(&mut self, timeout: Duration) -> io::Result<&ReceiverMetadata> {
         let deadline = Instant::now() + timeout;
-        while !(self.device_ready(self.pointer) && self.device_ready(self.keyboard))
+        while !(self.device_ready(self.pointer)
+            && self.device_ready(self.keyboard)
+            && self.device_ready(self.touch))
             && !self.metadata.disconnected
         {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -187,10 +204,13 @@ impl Sender {
                 "EIS sender did not complete its Connect handshake",
             ));
         }
-        if !self.device_ready(self.pointer) || !self.device_ready(self.keyboard) {
+        if !self.device_ready(self.pointer)
+            || !self.device_ready(self.keyboard)
+            || !self.device_ready(self.touch)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "EIS sender did not announce and resume both pointer and keyboard devices",
+                "EIS sender did not announce and resume pointer, keyboard, and touch devices",
             ));
         }
         Ok(&self.metadata)
@@ -307,6 +327,67 @@ impl Sender {
         Ok(())
     }
 
+    /// Begin a normalized touch contact. Up to 32 simultaneous contacts are
+    /// retained, well beyond Magic Trackpad 2's physical contact limit.
+    pub fn inject_touch_down(&mut self, id: u32, x: u16, y: u16) -> io::Result<()> {
+        if self.touches.contains_key(&id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "touch down reused an active tracking id",
+            ));
+        }
+        if self.touches.len() >= 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "touch contact limit reached",
+            ));
+        }
+        let device = self.require_ready(self.touch, "touch")?;
+        let (x, y) = touch_coordinates(device, x, y)?;
+        let touch = NonNull::new(unsafe { ei_device_touch_new(device.as_ptr()) })
+            .ok_or_else(|| io::Error::other("ei_device_touch_new returned NULL"))?;
+        self.ensure_emulating(device);
+        unsafe { ei_touch_down(touch.as_ptr(), x, y) };
+        self.frame(device);
+        self.touches.insert(id, touch);
+        Ok(())
+    }
+
+    /// Move an existing normalized contact on the remote touch surface.
+    pub fn inject_touch_motion(&mut self, id: u32, x: u16, y: u16) -> io::Result<()> {
+        let device = self.require_ready(self.touch, "touch")?;
+        let (x, y) = touch_coordinates(device, x, y)?;
+        let touch = self.touches.get(&id).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "touch motion has no active contact",
+            )
+        })?;
+        self.ensure_emulating(device);
+        unsafe { ei_touch_motion(touch.as_ptr(), x, y) };
+        self.frame(device);
+        Ok(())
+    }
+
+    /// End or cancel an active touch contact. Repeated termination is safe.
+    pub fn inject_touch_up(&mut self, id: u32, cancelled: bool) -> io::Result<()> {
+        let Some(touch) = self.touches.remove(&id) else {
+            return Ok(());
+        };
+        let device = self.require_ready(self.touch, "touch")?;
+        self.ensure_emulating(device);
+        unsafe {
+            if cancelled {
+                ei_touch_cancel(touch.as_ptr());
+            } else {
+                ei_touch_up(touch.as_ptr());
+            }
+            ei_touch_unref(touch.as_ptr());
+        }
+        self.frame(device);
+        Ok(())
+    }
+
     fn frame(&self, device: NonNull<EiDevice>) {
         unsafe { ei_device_frame(device.as_ptr(), ei_now(self.context.as_ptr())) };
     }
@@ -389,6 +470,7 @@ impl Sender {
                         CAP_KEYBOARD,
                         CAP_BUTTON,
                         CAP_SCROLL,
+                        CAP_TOUCH,
                         std::ptr::null::<c_void>(),
                     );
                 }
@@ -417,6 +499,9 @@ impl Sender {
                 {
                     self.scroll = NonNull::new(unsafe { ei_device_ref(device) });
                 }
+                if self.touch.is_none() && unsafe { ei_device_has_capability(device, CAP_TOUCH) } {
+                    self.touch = NonNull::new(unsafe { ei_device_ref(device) });
+                }
             }
             EI_EVENT_DEVICE_REMOVED => {
                 let device = unsafe { ei_event_get_device(event) };
@@ -428,6 +513,10 @@ impl Sender {
                 release_matching(&mut self.keyboard, device);
                 release_matching(&mut self.button, device);
                 release_matching(&mut self.scroll, device);
+                if self.touch.is_some_and(|slot| slot.as_ptr() == device) {
+                    self.release_touches_without_events();
+                }
+                release_matching(&mut self.touch, device);
                 self.pressed_keys.clear();
                 self.pressed_buttons.clear();
             }
@@ -443,13 +532,22 @@ impl Sender {
                 if self.button.is_some_and(|slot| slot.as_ptr() == device) {
                     self.pressed_buttons.clear();
                 }
+                if self.touch.is_some_and(|slot| slot.as_ptr() == device) {
+                    self.release_touches_without_events();
+                }
             }
             EI_EVENT_DEVICE_RESUMED => {
                 let device = unsafe { ei_event_get_device(event) };
-                if [self.pointer, self.keyboard, self.button, self.scroll]
-                    .into_iter()
-                    .flatten()
-                    .any(|slot| slot.as_ptr() == device)
+                if [
+                    self.pointer,
+                    self.keyboard,
+                    self.button,
+                    self.scroll,
+                    self.touch,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|slot| slot.as_ptr() == device)
                 {
                     let device = NonNull::new(device).expect("event device is non-NULL");
                     if !contains_device(&self.resumed, device) {
@@ -485,6 +583,21 @@ impl Sender {
                 self.frame(button);
             }
         }
+        if let Some(touch) = self.touch {
+            let touches = std::mem::take(&mut self.touches);
+            if !touches.is_empty() {
+                self.ensure_emulating(touch);
+                for (_, contact) in touches {
+                    unsafe {
+                        ei_touch_cancel(contact.as_ptr());
+                        ei_touch_unref(contact.as_ptr());
+                    }
+                }
+                self.frame(touch);
+            }
+        } else {
+            self.release_touches_without_events();
+        }
         for device in std::mem::take(&mut self.emulating) {
             unsafe { ei_device_stop_emulating(device.as_ptr()) };
         }
@@ -495,8 +608,39 @@ impl Sender {
         release_slot(&mut self.keyboard);
         release_slot(&mut self.button);
         release_slot(&mut self.scroll);
+        self.release_touches_without_events();
+        release_slot(&mut self.touch);
         self.resumed.clear();
     }
+
+    fn release_touches_without_events(&mut self) {
+        for (_, touch) in std::mem::take(&mut self.touches) {
+            unsafe { ei_touch_unref(touch.as_ptr()) };
+        }
+    }
+}
+
+fn touch_coordinates(device: NonNull<EiDevice>, x: u16, y: u16) -> io::Result<(f64, f64)> {
+    let region = unsafe { ei_device_get_region(device.as_ptr(), 0) };
+    if region.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "EIS touch device did not announce a touch region",
+        ));
+    }
+    let origin_x = unsafe { ei_region_get_x(region) } as f64;
+    let origin_y = unsafe { ei_region_get_y(region) } as f64;
+    let width = unsafe { ei_region_get_width(region) } as f64;
+    let height = unsafe { ei_region_get_height(region) } as f64;
+    if width <= 0.0 || height <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EIS touch region has invalid dimensions",
+        ));
+    }
+    let scale =
+        |value: u16, origin: f64, span: f64| origin + span * f64::from(value) / f64::from(u16::MAX);
+    Ok((scale(x, origin_x, width), scale(y, origin_y, height)))
 }
 
 impl Drop for Sender {

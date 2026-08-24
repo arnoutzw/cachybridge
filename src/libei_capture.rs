@@ -27,6 +27,9 @@ const EI_EVENT_SCROLL_STOP: c_int = 601;
 const EI_EVENT_SCROLL_CANCEL: c_int = 602;
 const EI_EVENT_SCROLL_DISCRETE: c_int = 603;
 const EI_EVENT_KEYBOARD_KEY: c_int = 700;
+const EI_EVENT_TOUCH_DOWN: c_int = 800;
+const EI_EVENT_TOUCH_UP: c_int = 801;
+const EI_EVENT_TOUCH_MOTION: c_int = 802;
 
 const CAP_POINTER: c_int = 1 << 0;
 const CAP_POINTER_ABSOLUTE: c_int = 1 << 1;
@@ -102,6 +105,10 @@ unsafe extern "C" {
     fn ei_event_scroll_get_discrete_dy(event: *mut EiEvent) -> i32;
     fn ei_event_keyboard_get_key(event: *mut EiEvent) -> u32;
     fn ei_event_keyboard_get_key_is_press(event: *mut EiEvent) -> bool;
+    fn ei_event_touch_get_id(event: *mut EiEvent) -> u32;
+    fn ei_event_touch_get_x(event: *mut EiEvent) -> f64;
+    fn ei_event_touch_get_y(event: *mut EiEvent) -> f64;
+    fn ei_event_touch_get_is_cancel(event: *mut EiEvent) -> bool;
 
     fn ei_seat_get_name(seat: *mut EiSeat) -> *const c_char;
     fn ei_seat_has_capability(seat: *mut EiSeat, capability: c_int) -> bool;
@@ -194,6 +201,23 @@ pub enum CapturedEvent {
     ScrollCancel {
         horizontal: bool,
         vertical: bool,
+    },
+    /// A physical touch contact normalized to its source EIS device region.
+    /// Normalization makes a Magic Trackpad's physical mm surface portable to
+    /// a remote desktop's logical touch region.
+    TouchDown {
+        id: u32,
+        x: u16,
+        y: u16,
+    },
+    TouchMotion {
+        id: u32,
+        x: u16,
+        y: u16,
+    },
+    TouchUp {
+        id: u32,
+        cancelled: bool,
     },
 }
 
@@ -477,9 +501,82 @@ fn decode_input_event(event: *mut EiEvent, event_type: c_int) -> io::Result<Opti
             horizontal: unsafe { ei_event_scroll_get_stop_x(event) },
             vertical: unsafe { ei_event_scroll_get_stop_y(event) },
         }),
+        EI_EVENT_TOUCH_DOWN | EI_EVENT_TOUCH_MOTION => {
+            let (x, y) = normalized_touch_coordinates(event)?;
+            let id = unsafe { ei_event_touch_get_id(event) };
+            if event_type == EI_EVENT_TOUCH_DOWN {
+                Some(CapturedEvent::TouchDown { id, x, y })
+            } else {
+                Some(CapturedEvent::TouchMotion { id, x, y })
+            }
+        }
+        EI_EVENT_TOUCH_UP => Some(CapturedEvent::TouchUp {
+            id: unsafe { ei_event_touch_get_id(event) },
+            cancelled: unsafe { ei_event_touch_get_is_cancel(event) },
+        }),
         _ => None,
     };
     Ok(decoded)
+}
+
+fn normalized_touch_coordinates(event: *mut EiEvent) -> io::Result<(u16, u16)> {
+    let x = unsafe { ei_event_touch_get_x(event) };
+    let y = unsafe { ei_event_touch_get_y(event) };
+    require_finite(x, y, "touch")?;
+    let device = unsafe { ei_event_get_device(event) };
+    if device.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "touch event has no EIS device",
+        ));
+    }
+    let mut region = unsafe { ei_device_get_region(device, 0) };
+    for index in 1.. {
+        if region.is_null() {
+            break;
+        }
+        let origin_x = unsafe { ei_region_get_x(region) } as f64;
+        let origin_y = unsafe { ei_region_get_y(region) } as f64;
+        let width = unsafe { ei_region_get_width(region) } as f64;
+        let height = unsafe { ei_region_get_height(region) } as f64;
+        if width > 0.0
+            && height > 0.0
+            && x >= origin_x
+            && x <= origin_x + width
+            && y >= origin_y
+            && y <= origin_y + height
+        {
+            return normalize_touch_point(x, y, origin_x, origin_y, width, height);
+        }
+        region = unsafe { ei_device_get_region(device, index) };
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "touch event is outside all valid EIS device regions",
+    ))
+}
+
+fn normalize_touch_point(
+    x: f64,
+    y: f64,
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
+) -> io::Result<(u16, u16)> {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "touch region has invalid dimensions",
+        ));
+    }
+    let normalize = |value: f64, origin: f64, span: f64| {
+        (((value - origin) / span).clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16
+    };
+    Ok((
+        normalize(x, origin_x, width),
+        normalize(y, origin_y, height),
+    ))
 }
 
 fn checked_evdev(value: u32, kind: &str) -> io::Result<u16> {
@@ -540,5 +637,18 @@ mod tests {
         assert!(checked_evdev(u32::from(u16::MAX) + 1, "key").is_err());
         assert!(require_finite(1.0, -1.0, "motion").is_ok());
         assert!(require_finite(f64::INFINITY, 0.0, "motion").is_err());
+    }
+
+    #[test]
+    fn touch_normalization_maps_a_physical_surface_to_the_full_wire_range() {
+        assert_eq!(
+            normalize_touch_point(10.0, 20.0, 10.0, 20.0, 160.0, 115.0).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            normalize_touch_point(170.0, 135.0, 10.0, 20.0, 160.0, 115.0).unwrap(),
+            (u16::MAX, u16::MAX)
+        );
+        assert!(normalize_touch_point(0.0, 0.0, 0.0, 0.0, 0.0, 1.0).is_err());
     }
 }

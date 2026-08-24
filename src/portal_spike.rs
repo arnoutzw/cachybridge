@@ -33,6 +33,7 @@ const REQUEST: &str = "org.freedesktop.portal.Request";
 const SESSION: &str = "org.freedesktop.portal.Session";
 const CAP_KEYBOARD: u32 = 1;
 const CAP_POINTER: u32 = 2;
+const CAP_TOUCHSCREEN: u32 = 4;
 const BARRIER_ID: u32 = 1;
 
 type Options<'a> = HashMap<&'a str, Value<'a>>;
@@ -75,6 +76,7 @@ impl CaptureEdge {
 pub enum CaptureCapabilities {
     PointerOnly,
     KeyboardPointer,
+    KeyboardPointerTouch,
 }
 
 impl CaptureCapabilities {
@@ -82,6 +84,7 @@ impl CaptureCapabilities {
         match self {
             Self::PointerOnly => CAP_POINTER,
             Self::KeyboardPointer => CAP_KEYBOARD | CAP_POINTER,
+            Self::KeyboardPointerTouch => CAP_KEYBOARD | CAP_POINTER | CAP_TOUCHSCREEN,
         }
     }
 
@@ -89,6 +92,7 @@ impl CaptureCapabilities {
         match self {
             Self::PointerOnly => "pointer",
             Self::KeyboardPointer => "keyboard+pointer",
+            Self::KeyboardPointerTouch => "keyboard+pointer+touchscreen",
         }
     }
 }
@@ -160,15 +164,15 @@ pub struct InputCaptureSession {
 }
 
 impl InputCaptureSession {
-    /// Request keyboard/pointer capture and arm the left edge.
+    /// Request keyboard, pointer, and touch capture and arm the left edge.
     pub fn start_left() -> CaptureResult<Self> {
-        Self::start(CaptureEdge::Left, CaptureCapabilities::KeyboardPointer)
+        Self::start(CaptureEdge::Left, CaptureCapabilities::KeyboardPointerTouch)
     }
 
     pub fn start_left_with_persistence(persistence: PortalPersistence) -> CaptureResult<Self> {
         Self::start_with_persistence(
             CaptureEdge::Left,
-            CaptureCapabilities::KeyboardPointer,
+            CaptureCapabilities::KeyboardPointerTouch,
             persistence,
         )
     }
@@ -967,6 +971,10 @@ mod tests {
         assert_eq!(
             CaptureCapabilities::KeyboardPointer.bits(),
             CAP_KEYBOARD | CAP_POINTER
+        );
+        assert_eq!(
+            CaptureCapabilities::KeyboardPointerTouch.bits(),
+            CAP_KEYBOARD | CAP_POINTER | CAP_TOUCHSCREEN
         );
         assert_eq!(CaptureEdge::Left.name(), "left");
         assert_eq!(CaptureEdge::Right.name(), "right");

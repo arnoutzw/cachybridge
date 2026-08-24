@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::{
     handoff::{HandoffAction, HandoffController, HandoffState, Point},
-    protocol::{Message, WireEdge, WireInputEvent},
+    protocol::{Message, TouchPhase, WireEdge, WireInputEvent, WireTouchEvent},
     transport::{SecureConnection, TransportError},
 };
 
@@ -89,6 +89,7 @@ impl MotionRate {
 pub enum CapturedInput {
     Motion { dx: i32, dy: i32 },
     Event(WireInputEvent),
+    Touch(WireTouchEvent),
 }
 
 /// Watches the controlled client's outer InputCapture barrier. It is separate
@@ -241,7 +242,7 @@ impl InputCaptureAdapter {
         Ok(Self {
             session: crate::portal_spike::InputCaptureSession::start(
                 edge,
-                crate::portal_spike::CaptureCapabilities::KeyboardPointer,
+                crate::portal_spike::CaptureCapabilities::KeyboardPointerTouch,
             )?,
             local_edge_x,
             active_activation: None,
@@ -261,7 +262,7 @@ impl InputCaptureAdapter {
         Ok(Self {
             session: crate::portal_spike::InputCaptureSession::start_with_persistence(
                 edge,
-                crate::portal_spike::CaptureCapabilities::KeyboardPointer,
+                crate::portal_spike::CaptureCapabilities::KeyboardPointerTouch,
                 persistence,
             )?,
             local_edge_x,
@@ -358,6 +359,37 @@ impl InputCaptureAdapter {
                         .into_iter()
                         .map(CapturedInput::Event),
                     );
+                }
+                crate::libei_capture::CapturedEvent::TouchDown { id, x, y } => {
+                    self.flush_motion();
+                    self.pending.push_back(CapturedInput::Touch(WireTouchEvent {
+                        phase: TouchPhase::Down,
+                        id,
+                        x,
+                        y,
+                    }));
+                }
+                crate::libei_capture::CapturedEvent::TouchMotion { id, x, y } => {
+                    self.flush_motion();
+                    self.pending.push_back(CapturedInput::Touch(WireTouchEvent {
+                        phase: TouchPhase::Motion,
+                        id,
+                        x,
+                        y,
+                    }));
+                }
+                crate::libei_capture::CapturedEvent::TouchUp { id, cancelled } => {
+                    self.flush_motion();
+                    self.pending.push_back(CapturedInput::Touch(WireTouchEvent {
+                        phase: if cancelled {
+                            TouchPhase::Cancel
+                        } else {
+                            TouchPhase::Up
+                        },
+                        id,
+                        x: 0,
+                        y: 0,
+                    }));
                 }
                 // InputCapture frames delimit a compositor update. Send one
                 // coherent move before transitions or this frame boundary.
@@ -551,6 +583,9 @@ fn captured_to_wire(event: crate::libei_capture::CapturedEvent) -> io::Result<Ve
         CapturedEvent::Frame { .. } => Ok(vec![wire_event(EV_SYN, SYN_REPORT, 0)]),
         CapturedEvent::ScrollStop { .. }
         | CapturedEvent::ScrollCancel { .. }
+        | CapturedEvent::TouchDown { .. }
+        | CapturedEvent::TouchMotion { .. }
+        | CapturedEvent::TouchUp { .. }
         | CapturedEvent::StartEmulating { .. }
         | CapturedEvent::StopEmulating => Ok(Vec::new()),
     }
@@ -692,6 +727,15 @@ impl InjectBackend for RemoteDesktopInjector {
         }
     }
 
+    fn inject_touch(&mut self, event: WireTouchEvent) -> io::Result<()> {
+        match event.phase {
+            TouchPhase::Down => self.session.inject_touch_down(event.id, event.x, event.y),
+            TouchPhase::Motion => self.session.inject_touch_motion(event.id, event.x, event.y),
+            TouchPhase::Up => self.session.inject_touch_up(event.id, false),
+            TouchPhase::Cancel => self.session.inject_touch_up(event.id, true),
+        }
+    }
+
     fn release_all(&mut self) -> io::Result<()> {
         self.session.release_all()
     }
@@ -721,6 +765,7 @@ pub trait InjectBackend {
     /// Inject one paired relative motion update in exactly one remote frame.
     fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()>;
     fn inject(&mut self, event: WireInputEvent) -> io::Result<()>;
+    fn inject_touch(&mut self, event: WireTouchEvent) -> io::Result<()>;
     /// Synthesizes releases for all pressed keys/buttons and closes the active
     /// injection scope. It must be safe to call more than once.
     fn release_all(&mut self) -> io::Result<()>;
@@ -826,6 +871,7 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
                 self.transport.send(Message::PointerMotion { dx, dy })?
             }
             CapturedInput::Event(event) => self.transport.send(Message::Input(event))?,
+            CapturedInput::Touch(event) => self.transport.send(Message::Touch(event))?,
         }
         Ok(())
     }
@@ -990,6 +1036,10 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 self.injector.inject_motion(dx, dy)?;
                 Ok(())
             }
+            Message::Touch(event) if self.remote_active => {
+                self.injector.inject_touch(event)?;
+                Ok(())
+            }
             Message::Input(_) => {
                 if self.return_pending {
                     // The host may have selected this input before receiving
@@ -1002,6 +1052,14 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 Err(SeamlessError::InputBeforeEntry)
             }
             Message::PointerMotion { .. } => {
+                if self.return_pending {
+                    Ok(())
+                } else {
+                    let _ = self.close();
+                    Err(SeamlessError::InputBeforeEntry)
+                }
+            }
+            Message::Touch(_) => {
                 if self.return_pending {
                     Ok(())
                 } else {
@@ -1101,6 +1159,7 @@ mod tests {
         prepared: Vec<Point>,
         motions: Vec<(i32, i32)>,
         inputs: Vec<WireInputEvent>,
+        touches: Vec<WireTouchEvent>,
         releases: usize,
     }
 
@@ -1117,6 +1176,11 @@ mod tests {
 
         fn inject(&mut self, event: WireInputEvent) -> io::Result<()> {
             self.inputs.push(event);
+            Ok(())
+        }
+
+        fn inject_touch(&mut self, event: WireTouchEvent) -> io::Result<()> {
+            self.touches.push(event);
             Ok(())
         }
 
@@ -1311,11 +1375,20 @@ mod tests {
         client
             .handle(Message::PointerMotion { dx: 7, dy: -4 })
             .unwrap();
+        client
+            .handle(Message::Touch(WireTouchEvent {
+                phase: TouchPhase::Down,
+                id: 17,
+                x: 12_000,
+                y: 34_000,
+            }))
+            .unwrap();
         client.handle(Message::HandoffRelease).unwrap();
         let (injector, transport) = client.into_parts();
         assert_eq!(injector.prepared, vec![Point { x: -1, y: 500 }]);
         assert_eq!(injector.motions, vec![(7, -4)]);
         assert_eq!(injector.inputs.len(), 1);
+        assert_eq!(injector.touches.len(), 1);
         assert_eq!(injector.releases, 1);
         assert_eq!(transport.sent, vec![Message::EnterAck]);
     }

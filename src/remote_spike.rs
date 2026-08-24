@@ -21,7 +21,7 @@ const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
 const REQUEST: &str = "org.freedesktop.portal.Request";
 const SESSION: &str = "org.freedesktop.portal.Session";
-const REQUIRED_DEVICE_TYPES: u32 = 1 | 2; // keyboard | pointer
+const REQUIRED_DEVICE_TYPES: u32 = 1 | 2 | 4; // keyboard | pointer | touchscreen
 
 type Options<'a> = HashMap<&'a str, Value<'a>>;
 type Results = HashMap<String, OwnedValue>;
@@ -123,6 +123,18 @@ impl RemoteDesktopSession {
             .inject_scroll_discrete(horizontal, vertical, finish)
     }
 
+    pub fn inject_touch_down(&mut self, id: u32, x: u16, y: u16) -> io::Result<()> {
+        self.sender_mut()?.inject_touch_down(id, x, y)
+    }
+
+    pub fn inject_touch_motion(&mut self, id: u32, x: u16, y: u16) -> io::Result<()> {
+        self.sender_mut()?.inject_touch_motion(id, x, y)
+    }
+
+    pub fn inject_touch_up(&mut self, id: u32, cancelled: bool) -> io::Result<()> {
+        self.sender_mut()?.inject_touch_up(id, cancelled)
+    }
+
     pub fn bounded_pointer_test(&mut self) -> io::Result<()> {
         self.sender_mut()?.bounded_pointer_test()
     }
@@ -170,11 +182,11 @@ fn start_session(persistence: PortalPersistence) -> RemoteResult<RemoteDesktopSe
         .map_err(|error| actionable(format!("read AvailableDeviceTypes: {error}")))?;
     if version < 2 || available & REQUIRED_DEVICE_TYPES != REQUIRED_DEVICE_TYPES {
         return Err(actionable(format!(
-            "RemoteDesktop v2 with keyboard+pointer is required; found version={version}, device_types={available}"
+            "RemoteDesktop v2 with keyboard, pointer, and touchscreen is required; found version={version}, device_types={available}"
         )));
     }
     println!(
-        "portal: RemoteDesktop v{version}, device_types={available} (keyboard+pointer available)"
+        "portal: RemoteDesktop v{version}, device_types={available} (keyboard+pointer+touchscreen available)"
     );
 
     let create_token = new_token("cachybridge_remote_create");
@@ -244,7 +256,7 @@ fn start_session(persistence: PortalPersistence) -> RemoteResult<RemoteDesktopSe
     println!("Start response: success, granted device_types={granted}");
     if granted & REQUIRED_DEVICE_TYPES != REQUIRED_DEVICE_TYPES {
         return Err(actionable(format!(
-            "portal consent did not grant keyboard+pointer; granted device_types={granted}"
+            "portal consent did not grant keyboard, pointer, and touchscreen; granted device_types={granted}"
         )));
     }
     let restore_token = if persistence.is_enabled() {

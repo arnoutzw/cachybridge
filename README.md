@@ -2,6 +2,14 @@
 
 CachyBridge shares one Bluetooth mouse and keyboard between two CachyOS/KDE Wayland desktops on the same LAN. Its seamless mode uses the desktop portals: crossing the host's configured outer edge captures input and sends it over an authenticated encrypted connection; the client injects it with RemoteDesktop, and its return edge releases the host capture.
 
+When both KDE portals expose the `TOUCHSCREEN` capability, CachyBridge also
+forwards multi-contact touch input from a Magic Trackpad 2. Contacts are
+normalized to the physical trackpad surface, encrypted, and mapped to the
+client's touch region. Update both iMacs together before reconnecting: touch
+support uses protocol version 5 and deliberately rejects older peers. The
+`cachybridge doctor --json` report shows `touchscreen: true` for both portals
+when the desktop can support this path.
+
 Version 4 adds an initial-pairing and topology setup wizard, including the client’s relative display location and optional persistent portal consent.
 
 See `outputs/cachybridge-demo-guide.md` for build, permission, and two-machine run instructions.

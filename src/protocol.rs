@@ -2,11 +2,11 @@
 
 use thiserror::Error;
 
-/// Version 4 adds atomic two-axis pointer-motion frames. This prevents the
-/// controlled compositor from rendering diagonal motion as separate horizontal
-/// and vertical updates.
+/// Version 5 adds normalized multi-touch contacts. Normalization lets a
+/// physical touch surface such as Magic Trackpad map safely to the remote
+/// compositor's touch region without assuming matching dimensions.
 /// Older handoff implementations fail closed during decoding.
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 pub const MAX_FRAME_PAYLOAD: usize = 64;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub const PEER_TIMEOUT_MS: u64 = 5_000;
@@ -21,9 +21,11 @@ const KIND_ENTER_REJECTED: u8 = 7;
 const KIND_HANDOFF_RELEASE: u8 = 8;
 const KIND_EXIT_REQUEST: u8 = 9;
 const KIND_POINTER_MOTION: u8 = 10;
+const KIND_TOUCH: u8 = 11;
 const INPUT_PAYLOAD_LEN: usize = 8;
 const ENTER_PAYLOAD_LEN: usize = 8;
 const EXIT_REQUEST_PAYLOAD_LEN: usize = 9;
+const TOUCH_PAYLOAD_LEN: usize = 9;
 
 /// An evdev-style event using Linux kernel type/code/value values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +33,26 @@ pub struct WireInputEvent {
     pub event_type: u16,
     pub code: u16,
     pub value: i32,
+}
+
+/// A phase in one independently tracked touch contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Motion,
+    Up,
+    Cancel,
+}
+
+/// Coordinates are normalized to the inclusive u16 range. This retains fine
+/// trackpad precision while allowing the client to map contacts to its own
+/// advertised touch region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireTouchEvent {
+    pub phase: TouchPhase,
+    pub id: u32,
+    pub x: u16,
+    pub y: u16,
 }
 
 /// A horizontal logical display edge represented independently of compositor
@@ -76,6 +98,7 @@ pub enum Message {
         dx: i32,
         dy: i32,
     },
+    Touch(WireTouchEvent),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,6 +117,8 @@ pub enum ProtocolError {
     InvalidPayloadLength { kind: u8, actual: usize },
     #[error("invalid horizontal edge value {0}")]
     InvalidEdge(u8),
+    #[error("invalid touch phase value {0}")]
+    InvalidTouchPhase(u8),
 }
 
 pub fn encode_frame(message: Message) -> Vec<u8> {
@@ -132,6 +157,19 @@ pub fn encode_frame(message: Message) -> Vec<u8> {
             payload[..4].copy_from_slice(&dx.to_be_bytes());
             payload[4..].copy_from_slice(&dy.to_be_bytes());
             (KIND_POINTER_MOTION, payload.to_vec())
+        }
+        Message::Touch(event) => {
+            let mut payload = [0_u8; TOUCH_PAYLOAD_LEN];
+            payload[0] = match event.phase {
+                TouchPhase::Down => 0,
+                TouchPhase::Motion => 1,
+                TouchPhase::Up => 2,
+                TouchPhase::Cancel => 3,
+            };
+            payload[1..5].copy_from_slice(&event.id.to_be_bytes());
+            payload[5..7].copy_from_slice(&event.x.to_be_bytes());
+            payload[7..9].copy_from_slice(&event.y.to_be_bytes());
+            (KIND_TOUCH, payload.to_vec())
         }
     };
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -196,9 +234,24 @@ pub fn decode_frame(frame: &[u8]) -> Result<Message, ProtocolError> {
             dx: i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
             dy: i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
         }),
+        KIND_TOUCH if payload.len() == TOUCH_PAYLOAD_LEN => {
+            let phase = match payload[0] {
+                0 => TouchPhase::Down,
+                1 => TouchPhase::Motion,
+                2 => TouchPhase::Up,
+                3 => TouchPhase::Cancel,
+                value => return Err(ProtocolError::InvalidTouchPhase(value)),
+            };
+            Ok(Message::Touch(WireTouchEvent {
+                phase,
+                id: u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]),
+                x: u16::from_be_bytes([payload[5], payload[6]]),
+                y: u16::from_be_bytes([payload[7], payload[8]]),
+            }))
+        }
         KIND_INPUT | KIND_HEARTBEAT | KIND_RELEASE_ALL | KIND_GOODBYE | KIND_ENTER
         | KIND_ENTER_ACK | KIND_ENTER_REJECTED | KIND_HANDOFF_RELEASE | KIND_EXIT_REQUEST
-        | KIND_POINTER_MOTION => Err(ProtocolError::InvalidPayloadLength {
+        | KIND_POINTER_MOTION | KIND_TOUCH => Err(ProtocolError::InvalidPayloadLength {
             kind,
             actual: payload.len(),
         }),
@@ -223,8 +276,8 @@ mod tests {
     #[test]
     fn rejects_future_version() {
         assert_eq!(
-            decode_frame(&[5, KIND_HEARTBEAT, 0, 0]),
-            Err(ProtocolError::UnsupportedVersion(5))
+            decode_frame(&[PROTOCOL_VERSION + 1, KIND_HEARTBEAT, 0, 0]),
+            Err(ProtocolError::UnsupportedVersion(PROTOCOL_VERSION + 1))
         );
     }
 
@@ -249,6 +302,12 @@ mod tests {
                 y: 612,
             },
             Message::PointerMotion { dx: 8, dy: -5 },
+            Message::Touch(WireTouchEvent {
+                phase: TouchPhase::Motion,
+                id: 42,
+                x: 32_000,
+                y: 16_000,
+            }),
         ] {
             assert_eq!(decode_frame(&encode_frame(message)), Ok(message));
         }
@@ -262,6 +321,28 @@ mod tests {
                 kind: KIND_ENTER,
                 actual: 0,
             })
+        );
+    }
+
+    #[test]
+    fn touch_rejects_unknown_phase_before_injection() {
+        assert_eq!(
+            decode_frame(&[
+                PROTOCOL_VERSION,
+                KIND_TOUCH,
+                0,
+                TOUCH_PAYLOAD_LEN as u8,
+                9,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ]),
+            Err(ProtocolError::InvalidTouchPhase(9))
         );
     }
 

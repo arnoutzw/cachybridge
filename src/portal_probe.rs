@@ -12,6 +12,7 @@ const INPUT_CAPTURE: &str = "org.freedesktop.portal.InputCapture";
 const REMOTE_DESKTOP: &str = "org.freedesktop.portal.RemoteDesktop";
 const KEYBOARD: u32 = 1;
 const POINTER: u32 = 2;
+const TOUCHSCREEN: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceProbe {
@@ -22,9 +23,10 @@ pub struct InterfaceProbe {
 }
 
 impl InterfaceProbe {
-    fn supports_keyboard_and_pointer(&self) -> bool {
-        self.capabilities
-            .is_some_and(|value| value & (KEYBOARD | POINTER) == KEYBOARD | POINTER)
+    fn supports_shared_input(&self) -> bool {
+        self.capabilities.is_some_and(|value| {
+            value & (KEYBOARD | POINTER | TOUCHSCREEN) == KEYBOARD | POINTER | TOUCHSCREEN
+        })
     }
 }
 
@@ -56,7 +58,7 @@ impl DoctorReport {
                 .input_capture
                 .version
                 .is_some_and(|version| version >= 2)
-            && self.input_capture.supports_keyboard_and_pointer()
+            && self.input_capture.supports_shared_input()
             && self.libei_version.is_some()
             && self.has_wayland_session()
     }
@@ -67,7 +69,7 @@ impl DoctorReport {
                 .remote_desktop
                 .version
                 .is_some_and(|version| version >= 2)
-            && self.remote_desktop.supports_keyboard_and_pointer()
+            && self.remote_desktop.supports_shared_input()
             && self.libei_version.is_some()
             && self.has_wayland_session()
     }
@@ -380,7 +382,7 @@ fn format_error(error: Option<&str>) -> String {
 
 fn print_interface(name: &str, probe: &InterfaceProbe, capability_name: &str) {
     println!(
-        "{name}: {} version={} {capability_name}={} keyboard={} pointer={}{}",
+        "{name}: {} version={} {capability_name}={} keyboard={} pointer={} touchscreen={}{}",
         yes_no(probe.available),
         probe
             .version
@@ -390,6 +392,7 @@ fn print_interface(name: &str, probe: &InterfaceProbe, capability_name: &str) {
             .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
         yes_no(probe.capabilities.unwrap_or(0) & KEYBOARD != 0),
         yes_no(probe.capabilities.unwrap_or(0) & POINTER != 0),
+        yes_no(probe.capabilities.unwrap_or(0) & TOUCHSCREEN != 0),
         format_error(probe.error.as_deref())
     );
 }
@@ -416,6 +419,14 @@ fn write_interface_json(json: &mut String, name: &str, probe: &InterfaceProbe) {
         json,
         "    \"pointer\": {},",
         probe.capabilities.is_some_and(|value| value & POINTER != 0)
+    )
+    .unwrap();
+    writeln!(
+        json,
+        "    \"touchscreen\": {},",
+        probe
+            .capabilities
+            .is_some_and(|value| value & TOUCHSCREEN != 0)
     )
     .unwrap();
     writeln!(
@@ -470,7 +481,7 @@ mod tests {
         let ready_interface = InterfaceProbe {
             available: true,
             version: Some(2),
-            capabilities: Some(KEYBOARD | POINTER),
+            capabilities: Some(KEYBOARD | POINTER | TOUCHSCREEN),
             error: None,
         };
         let report = DoctorReport {
@@ -491,6 +502,11 @@ mod tests {
         };
         assert!(report.controller_ready());
         assert!(report.follower_ready());
+        let without_touch = InterfaceProbe {
+            capabilities: Some(KEYBOARD | POINTER),
+            ..report.input_capture.clone()
+        };
+        assert!(!without_touch.supports_shared_input());
     }
 
     #[test]
