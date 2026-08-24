@@ -38,6 +38,13 @@ For an installed build, place `cachybridge` and `cachybridge-setup` in the same
 binary directory and run `cachybridge setup`. Use `--config PATH` to work with
 a non-default v4 configuration file.
 
+The tray menu includes **Start and reconnect at login**. After a pairing has
+started a sharing session once, CachyBridge records the chosen role, paired
+peer, and display geometry locally; enabling that option writes a user
+autostart entry and restores the appropriate host or client session on the
+next desktop login. Pairing keys and portal restore tokens remain in the
+private v4 configuration rather than the desktop entry.
+
 One-time codes are five easy-to-type Base32 characters. They are authenticated
 with SPAKE2 before the normal Noise handshake, preventing an observer from
 checking captured pairing traffic against the short code offline. The temporary

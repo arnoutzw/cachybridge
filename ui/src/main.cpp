@@ -1369,6 +1369,12 @@ int main(int argc, char **argv) {
     });
     if (roleDialog.exec() != QDialog::Accepted)
         return 0;
+    {
+        QSettings settings;
+        settings.setValue(QStringLiteral("startup/role"),
+            roleDialog.role() == MachineRole::Host ? QStringLiteral("host") : QStringLiteral("client"));
+        settings.sync();
+    }
     SetupWindow window(std::make_unique<CliSetupStore>(
         parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
     activeSetupWindow = &window;
