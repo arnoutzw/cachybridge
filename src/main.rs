@@ -43,6 +43,10 @@ use crate::{
 
 const DEFAULT_PORT: u16 = 45_231;
 const INPUT_QUEUE_CAPACITY: usize = 1_024;
+/// The client must service both its local return barrier and remote input.
+/// One millisecond limits the event-driven EIS injection wait without busy
+/// spinning a CPU core while the pointer is idle.
+const CLIENT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -774,7 +778,7 @@ fn run_seamless_client_with_sessions(
                         "seamless host heartbeat timed out",
                     )));
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
             }
         }
     };

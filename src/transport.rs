@@ -50,6 +50,11 @@ pub struct SecureConnection {
 
 impl SecureConnection {
     pub fn connect(stream: TcpStream, role: Role, psk: &[u8; 32]) -> Result<Self, TransportError> {
+        // Input records are tiny and latency-sensitive. Nagle's algorithm can
+        // hold a pointer update while it waits for an ACK from the preceding
+        // update, adding an avoidable delayed-ACK-sized jitter burst on LANs.
+        // Reliability still comes from TCP; this only disables aggregation.
+        stream.set_nodelay(true)?;
         let params: NoiseParams = NOISE_PATTERN.parse().expect("valid static pattern");
         let builder = Builder::new(params).psk(0, psk);
         let mut handshake = match role {
@@ -202,6 +207,29 @@ mod tests {
                 .unwrap();
         conn.send(Message::Heartbeat).unwrap();
         assert_eq!(conn.receive().unwrap(), Message::ReleaseAll);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn encrypted_connection_disables_nagle_for_small_input_records() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind loopback TCP listener: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = SecureConnection::connect(stream, Role::Client, &[3_u8; 32]).unwrap();
+            assert!(connection.stream.nodelay().unwrap());
+        });
+        let connection = SecureConnection::connect(
+            TcpStream::connect(address).unwrap(),
+            Role::Host,
+            &[3_u8; 32],
+        )
+        .unwrap();
+        assert!(connection.stream.nodelay().unwrap());
         server.join().unwrap();
     }
 
