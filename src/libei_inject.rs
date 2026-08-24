@@ -232,7 +232,14 @@ impl Sender {
             ));
         }
         let device = self.require_ready(self.keyboard, "keyboard")?;
-        update_pressed(&mut self.pressed_keys, evdev, state, "key")?;
+        // Portal capture can replay a transition while an edge handoff is
+        // completing, after `release_all` has intentionally cleared this
+        // ledger. Treat that replay as an idempotent no-op rather than
+        // crashing the whole KVM session. A real pressed key is still always
+        // released by `release_all` on every close path.
+        if !update_pressed(&mut self.pressed_keys, evdev, state) {
+            return Ok(());
+        }
         self.ensure_emulating(device);
         unsafe { ei_device_keyboard_key(device.as_ptr(), evdev.into(), state.is_pressed()) };
         self.frame(device);
@@ -248,7 +255,9 @@ impl Sender {
             ));
         }
         let device = self.require_ready(self.button, "button")?;
-        update_pressed(&mut self.pressed_buttons, evdev, state, "button")?;
+        if !update_pressed(&mut self.pressed_buttons, evdev, state) {
+            return Ok(());
+        }
         self.ensure_emulating(device);
         unsafe { ei_device_button_button(device.as_ptr(), evdev.into(), state.is_pressed()) };
         self.frame(device);
@@ -522,23 +531,10 @@ fn validate_axis_pair(x: f64, y: f64, kind: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn update_pressed(
-    pressed: &mut BTreeSet<u16>,
-    code: u16,
-    state: InputState,
-    kind: &str,
-) -> io::Result<()> {
-    let changed = match state {
+fn update_pressed(pressed: &mut BTreeSet<u16>, code: u16, state: InputState) -> bool {
+    match state {
         InputState::Pressed => pressed.insert(code),
         InputState::Released => pressed.remove(&code),
-    };
-    if changed {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("duplicate or unmatched {kind} transition for code {code}"),
-        ))
     }
 }
 
@@ -626,11 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn pressed_ledger_rejects_duplicate_and_unmatched_transitions() {
+    fn pressed_ledger_makes_duplicate_and_unmatched_transitions_idempotent() {
         let mut pressed = BTreeSet::new();
-        assert!(update_pressed(&mut pressed, 30, InputState::Pressed, "key").is_ok());
-        assert!(update_pressed(&mut pressed, 30, InputState::Pressed, "key").is_err());
-        assert!(update_pressed(&mut pressed, 30, InputState::Released, "key").is_ok());
-        assert!(update_pressed(&mut pressed, 30, InputState::Released, "key").is_err());
+        assert!(update_pressed(&mut pressed, 30, InputState::Pressed));
+        assert!(!update_pressed(&mut pressed, 30, InputState::Pressed));
+        assert!(update_pressed(&mut pressed, 30, InputState::Released));
+        assert!(!update_pressed(&mut pressed, 30, InputState::Released));
     }
 }
