@@ -26,8 +26,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(10);
 
 const SUPPORTED_MIME_TYPES: &[&str] = &[
-    "text/plain;charset=utf-8",
     "text/plain",
+    "text/plain;charset=utf-8",
     "image/png",
     "image/jpeg",
     "image/webp",
@@ -77,6 +77,11 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
         if let Some(record) = connection.poll_receive_payload()? {
             if let Some(content) = receive_record(&record, &mut incoming)? {
                 write_content(&content)?;
+                eprintln!(
+                    "clipboard received {} ({} bytes)",
+                    content.mime_type,
+                    content.bytes.len()
+                );
                 last_value = Some(content);
             }
         }
@@ -84,6 +89,11 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
             if let Some(content) = read_content()? {
                 if last_value.as_ref() != Some(&content) {
                     send_content(&mut connection, &content)?;
+                    eprintln!(
+                        "clipboard sent {} ({} bytes)",
+                        content.mime_type,
+                        content.bytes.len()
+                    );
                     last_value = Some(content);
                 }
             }
@@ -250,7 +260,15 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
         return Ok(None);
     }
     let content = ClipboardContent {
-        mime_type: (*mime_type).to_owned(),
+        // Advertise the broadly interoperable text target. Some clients offer
+        // the charset-qualified alias but only request `text/plain` when
+        // pasting, so forwarding that alias unchanged makes the clipboard
+        // appear empty despite a successful transfer.
+        mime_type: if mime_type.starts_with("text/") {
+            "text/plain".to_owned()
+        } else {
+            (*mime_type).to_owned()
+        },
         bytes: output.stdout,
     };
     validate_content(&content)?;
