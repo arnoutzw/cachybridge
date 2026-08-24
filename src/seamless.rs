@@ -340,8 +340,16 @@ impl InputCaptureAdapter {
                     self.flush_motion();
                     // Avoid double injection when the same physical scroll
                     // was also delivered as a smooth pixel update this frame.
-                    let horizontal = if self.smooth_scroll_axes.0 { 0 } else { horizontal };
-                    let vertical = if self.smooth_scroll_axes.1 { 0 } else { vertical };
+                    let horizontal = if self.smooth_scroll_axes.0 {
+                        0
+                    } else {
+                        horizontal
+                    };
+                    let vertical = if self.smooth_scroll_axes.1 {
+                        0
+                    } else {
+                        vertical
+                    };
                     self.pending.extend(
                         captured_to_wire(crate::libei_capture::CapturedEvent::ScrollDiscrete {
                             horizontal,
@@ -658,18 +666,16 @@ impl InjectBackend for RemoteDesktopInjector {
             (EV_SYN, SYN_REPORT) => Ok(()),
             (EV_REL, REL_X) => self.session.inject_relative(f64::from(event.value), 0.0),
             (EV_REL, REL_Y) => self.session.inject_relative(0.0, f64::from(event.value)),
-            (EV_REL, REL_HWHEEL_HI_RES) => self
-                .session
-                .inject_scroll(f64::from(event.value), 0.0, false),
-            (EV_REL, REL_WHEEL_HI_RES) => self
-                .session
-                .inject_scroll(0.0, f64::from(event.value), false),
-            (EV_REL, REL_HWHEEL) => self
-                .session
-                .inject_scroll_discrete(event.value, 0, false),
-            (EV_REL, REL_WHEEL) => self
-                .session
-                .inject_scroll_discrete(0, event.value, false),
+            (EV_REL, REL_HWHEEL_HI_RES) => {
+                self.session
+                    .inject_scroll(f64::from(event.value), 0.0, false)
+            }
+            (EV_REL, REL_WHEEL_HI_RES) => {
+                self.session
+                    .inject_scroll(0.0, f64::from(event.value), false)
+            }
+            (EV_REL, REL_HWHEEL) => self.session.inject_scroll_discrete(event.value, 0, false),
+            (EV_REL, REL_WHEEL) => self.session.inject_scroll_discrete(0, event.value, false),
             (EV_KEY, code) if code >= BTN_MOUSE_FIRST => self
                 .session
                 .inject_button(code, Self::input_state(event.value)?),

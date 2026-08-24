@@ -16,16 +16,16 @@ An end-to-end run without physical input devices uses `client --dry-run` and `ho
 
 ## Native v4 setup wizard
 
-The Qt 6 Widgets wizard offers the normal **Easy one-time pairing** flow:
+The Qt 6 Widgets wizard offers a host-led **Easy one-time pairing** flow:
 
-1. On the controlled client iMac, choose **Show one-time code on this client
-   iMac**.
-2. On the input-owner host iMac, choose **Find nearby clients**, select the
-   discovered client, then enter the displayed code and client placement.
-3. Both machines save the new peer automatically; the code expires after five
+1. Open CachyBridge's tray utility on the controlled client iMac. It announces
+   that client as ready, but does not create a pairing code yet.
+2. On the input-owner host iMac, refresh **Ready client iMacs** and select a
+   discovered client. The client tray immediately opens a large, readable
+   five-character code dialog.
+3. Enter that code on the host and choose **Pair selected client**. Both
+   machines save the new peer automatically; the code expires after five
    minutes and works for one successful join only.
-
-The wizard also retains the manual PSK form for recovery and advanced setups.
 
 ```bash
 cargo build --release --offline
@@ -49,9 +49,11 @@ One-time codes are five easy-to-type Base32 characters. They are authenticated
 with SPAKE2 before the normal Noise handshake, preventing an observer from
 checking captured pairing traffic against the short code offline. The temporary
 encrypted connection transfers a fresh 256-bit long-term key; the displayed
-code is never saved. While a client is waiting, it announces only its friendly
-name and pairing port over local mDNS (with a same-subnet UDP fallback), never
-the code or any secret. The manual PSK path delegates validation and saving to
+code is never saved. While the client tray is open, it announces only its
+friendly name and pairing port over local mDNS (with a same-subnet UDP
+fallback), never the code or any secret. Selecting it sends a local UDP request
+that causes the client itself to show a new code and open its short-lived TCP
+pairing listener. The manual PSK path delegates validation and saving to
 `cachybridge peer-add`; its tokens are passed through owner-only temporary
 files, never process arguments. The
 persistent-permissions setting is stored per peer in the private v4 config;

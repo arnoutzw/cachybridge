@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QAbstractItemView>
 #include <QCheckBox>
 #include <QCommandLineParser>
 #include <QDateTime>
@@ -15,9 +16,11 @@
 #include <QGuiApplication>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QHostAddress>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMessageBox>
@@ -37,11 +40,13 @@
 #include <QTabWidget>
 #include <QTextStream>
 #include <QTimer>
+#include <QUdpSocket>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
 #include <functional>
+#include <cstring>
 #include <memory>
 #include <optional>
 
@@ -108,6 +113,20 @@ QString clipboardToolPath(const QString &name) {
 bool clipboardToolsAvailable() {
     return !clipboardToolPath(QStringLiteral("wl-copy")).isEmpty()
         && !clipboardToolPath(QStringLiteral("wl-paste")).isEmpty();
+}
+
+bool requestClientPairingCode(const QString &endpoint) {
+    const int separator = endpoint.lastIndexOf(u':');
+    if (separator <= 0)
+        return false;
+    QHostAddress address;
+    bool portOk = false;
+    const quint16 port = endpoint.sliced(separator + 1).toUShort(&portOk);
+    if (!address.setAddress(endpoint.left(separator)) || !portOk || port == 0)
+        return false;
+    constexpr auto request = "CachyBridgePairRequest/1";
+    QUdpSocket socket;
+    return socket.writeDatagram(request, address, port) == qint64(strlen(request));
 }
 
 struct SetupDraft {
@@ -188,7 +207,7 @@ QString detectedLanCidr() {
 QString firewallPermissionMarkerPath() {
     const QString directory = QStandardPaths::writableLocation(
         QStandardPaths::AppLocalDataLocation);
-    return directory.isEmpty() ? QString() : directory + QStringLiteral("/firewall-v2-ready");
+    return directory.isEmpty() ? QString() : directory + QStringLiteral("/firewall-v3-ready");
 }
 
 bool firewallPermissionConfigured() {
@@ -201,7 +220,7 @@ bool rememberFirewallPermission() {
     if (marker.isEmpty() || !QDir().mkpath(QFileInfo(marker).absolutePath()))
         return false;
     QSaveFile file(marker);
-    if (!file.open(QIODevice::WriteOnly) || file.write("ports=45231:45234\n") < 0)
+    if (!file.open(QIODevice::WriteOnly) || file.write("tcp=45231:45234\nudp=45232\n") < 0)
         return false;
     file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
     return file.commit();
@@ -589,6 +608,23 @@ public:
             return details.isEmpty()
                 ? QStringLiteral("Firewall access was not granted.") : details;
         }
+        QProcess pairingRule;
+        pairingRule.start(QStringLiteral("pkexec"), {
+            ufw, QStringLiteral("allow"), QStringLiteral("from"), subnet,
+            QStringLiteral("to"), QStringLiteral("any"), QStringLiteral("port"),
+            QStringLiteral("45232"), QStringLiteral("proto"), QStringLiteral("udp"),
+        });
+        if (!pairingRule.waitForStarted())
+            return QStringLiteral("Could not request administrator authorization for pairing discovery.");
+        if (!pairingRule.waitForFinished(60000)) {
+            pairingRule.kill();
+            return QStringLiteral("Pairing-discovery firewall authorization timed out.");
+        }
+        if (pairingRule.exitStatus() != QProcess::NormalExit || pairingRule.exitCode() != 0) {
+            const QString details = QString::fromUtf8(pairingRule.readAllStandardError()).trimmed();
+            return details.isEmpty()
+                ? QStringLiteral("LAN pairing requests were not allowed.") : details;
+        }
         if (!rememberFirewallPermission())
             return QStringLiteral("Firewall rule was added, but CachyBridge could not remember the approval state.");
         return {};
@@ -754,12 +790,12 @@ public:
                 "No input portal is opened by this setup window."));
         intro->setWordWrap(true);
 
-        hostName_ = new QLineEdit(QSysInfo::machineHostName());
+        hostName_ = new QLineEdit(QSysInfo::machineHostName(), this);
         pairingCode_ = new QLineEdit;
         pairingCode_->setPlaceholderText(QStringLiteral("ABCDE"));
         pairingCode_->setMaxLength(5);
-        pairingAddress_ = new QLineEdit;
-        pairingAddress_->setPlaceholderText(QStringLiteral("Client address, e.g. 192.168.2.24:45232"));
+        pairingAddress_ = new QLineEdit(this);
+        pairingAddress_->setVisible(false);
 
         auto *easyPairing = new QWidget;
         auto *easyLayout = new QVBoxLayout(easyPairing);
@@ -857,7 +893,7 @@ public:
         });
         auto *firewallButton = new QPushButton(QStringLiteral("Allow CachyBridge on this LAN…"));
         firewallButton->setToolTip(QStringLiteral(
-            "Optional one-time administrator action. It saves a persistent UFW rule for CachyBridge input, pairing, and clipboard ports."));
+            "Optional one-time administrator action. It saves persistent UFW rules for CachyBridge input, clipboard, and host-led pairing requests."));
         if (firewallPermissionConfigured()) {
             firewallButton->setText(QStringLiteral("CachyBridge LAN access configured"));
             firewallButton->setEnabled(false);
@@ -917,13 +953,24 @@ public:
             QMessageBox::information(this, QStringLiteral("Clipboard support ready"),
                 QStringLiteral("Restart the CachyBridge sharing session on both iMacs to begin syncing text."));
         });
-        auto *joinButton = new QPushButton(QStringLiteral("Connect host to client with code"));
+        auto *nearbyClients = new QListWidget;
+        nearbyClients->setMinimumHeight(150);
+        nearbyClients->setSelectionMode(QAbstractItemView::SingleSelection);
+        nearbyClients->setToolTip(QStringLiteral(
+            "Only client iMacs with the CachyBridge tray open appear here."));
+        auto *refreshClients = new QPushButton(QStringLiteral("Refresh nearby client iMacs"));
+        auto *joinButton = new QPushButton(QStringLiteral("Pair selected client"));
+        joinButton->setEnabled(false);
+        QFont pairingCodeFont = pairingCode_->font();
+        pairingCodeFont.setPointSize(pairingCodeFont.pointSize() + 6);
+        pairingCodeFont.setBold(true);
+        pairingCode_->setFont(pairingCodeFont);
         connect(joinButton, &QPushButton::clicked, this, [this] {
             const PairJoinDraft draft{hostName_->text().trimmed(), pairingAddress_->text().trimmed(),
                 pairingCode_->text().trimmed(), selectedPlacement(), persistent_->isChecked()};
             if (draft.localName.isEmpty() || draft.clientAddress.isEmpty() || draft.code.isEmpty()) {
                 pairingStatus_->setText(QStringLiteral(
-                    "Enter this host's name, the client address, and the displayed code."));
+                    "Select a nearby client, then enter the five-character code shown on that client."));
                 return;
             }
             QString peerId;
@@ -950,42 +997,67 @@ public:
             });
         });
         auto *joinForm = new QFormLayout;
-        joinForm->addRow(QStringLiteral("Client address"), pairingAddress_);
-        joinForm->addRow(QStringLiteral("One-time code"), pairingCode_);
-        auto *discoverButton = new QPushButton(QStringLiteral("Find nearby clients"));
-        connect(discoverButton, &QPushButton::clicked, this, [this] {
+        joinForm->addRow(QStringLiteral("Code from selected client"), pairingCode_);
+        const auto refreshNearbyClients = [this, nearbyClients, joinButton] {
             QString error;
             const QStringList clients = store_->discoverPairClients(&error);
+            nearbyClients->clear();
+            joinButton->setEnabled(false);
             if (!error.isEmpty()) {
                 pairingStatus_->setText(QStringLiteral("Discovery failed: %1").arg(error));
                 return;
             }
             if (clients.isEmpty()) {
                 pairingStatus_->setText(QStringLiteral(
-                    "No client found. Open setup on the client and show its one-time code first."));
+                    "No ready clients found. Open the CachyBridge tray on the client iMac, then refresh."));
                 return;
             }
-            QString selected = clients.first();
-            if (clients.size() > 1) {
-                bool accepted = false;
-                selected = QInputDialog::getItem(this, QStringLiteral("Choose a client"),
-                    QStringLiteral("Nearby clients"), clients, 0, false, &accepted);
-                if (!accepted) return;
+            for (const QString &client : clients) {
+                const int separator = client.indexOf(u'\t');
+                if (separator <= 0)
+                    continue;
+                const QString endpoint = client.left(separator);
+                const QString name = client.sliced(separator + 1);
+                auto *item = new QListWidgetItem(
+                    QStringLiteral("%1  —  %2").arg(name, endpoint), nearbyClients);
+                item->setData(Qt::UserRole, endpoint);
             }
-            const int separator = selected.indexOf(u'\t');
-            if (separator <= 0) return;
-            pairingAddress_->setText(selected.left(separator));
-        });
+            pairingStatus_->setText(QStringLiteral(
+                "Select a client. It will immediately show its five-character pairing code."));
+        };
+        connect(refreshClients, &QPushButton::clicked, this, refreshNearbyClients);
+        connect(nearbyClients, &QListWidget::currentItemChanged, this,
+            [this, joinButton](QListWidgetItem *item, QListWidgetItem *) {
+                joinButton->setEnabled(false);
+                if (!item)
+                    return;
+                const QString endpoint = item->data(Qt::UserRole).toString();
+                if (!requestClientPairingCode(endpoint)) {
+                    pairingStatus_->setText(QStringLiteral(
+                        "Could not ask this client to show a pairing code. Refresh and try again."));
+                    return;
+                }
+                pairingAddress_->setText(endpoint);
+                pairingCode_->clear();
+                pairingCode_->setFocus();
+                joinButton->setEnabled(true);
+                pairingStatus_->setText(QStringLiteral(
+                    "The selected client is showing a large pairing code. Enter it here, then pair."));
+            });
         easyLayout->addWidget(firewallButton);
         easyLayout->addWidget(clipboardSupport);
         easyLayout->addWidget(hostButton);
         hostConnectPanel_ = new QWidget;
         auto *hostConnectLayout = new QVBoxLayout(hostConnectPanel_);
         hostConnectLayout->setContentsMargins(0, 0, 0, 0);
+        hostConnectLayout->addWidget(new QLabel(QStringLiteral("Ready client iMacs")));
+        hostConnectLayout->addWidget(nearbyClients);
+        hostConnectLayout->addWidget(refreshClients);
         hostConnectLayout->addLayout(joinForm);
-        hostConnectLayout->addWidget(discoverButton);
         hostConnectLayout->addWidget(joinButton);
         easyLayout->addWidget(hostConnectPanel_);
+        if (role_ == MachineRole::Host)
+            QTimer::singleShot(0, this, refreshNearbyClients);
 
         auto *placementBox = new QWidget;
         auto *placementLayout = new QVBoxLayout(placementBox);
@@ -1208,13 +1280,13 @@ public:
         kvmHeartbeat->start();
         clipboardHeartbeat->start();
 
-        hostButton->setVisible(role_ == MachineRole::Client);
+        hostButton->setVisible(false);
         firewallButton->setVisible(role_ == MachineRole::Client);
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
         clientCodeCard_->setVisible(false);
         pairingStatus_->setText(role_ == MachineRole::Host
-            ? QStringLiteral("Enter the client’s address and displayed code, or find a nearby client.")
-            : QStringLiteral("Create a code here, then enter it from the host iMac."));
+            ? QStringLiteral("Select a nearby client iMac to request its pairing code.")
+            : QStringLiteral("Keep the CachyBridge tray open. A host can then discover this client and request a pairing code."));
         tabs->setTabEnabled(2, role_ == MachineRole::Host);
     }
 

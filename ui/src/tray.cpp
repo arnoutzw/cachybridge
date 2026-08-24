@@ -1,21 +1,36 @@
 #include <QApplication>
 #include <QAction>
+#include <QDialog>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QFont>
+#include <QLabel>
 #include <QLocalSocket>
 #include <QMenu>
+#include <QMessageBox>
+#include <QNetworkDatagram>
+#include <QPointer>
 #include <QProcess>
+#include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QSysInfo>
 #include <QTimer>
+#include <QUdpSocket>
+#include <QVBoxLayout>
 
 #include <KStatusNotifierItem>
 
+#include <cstring>
+
 namespace {
+
+constexpr quint16 pairingPort = 45'232;
+const QByteArray pairingRequest = QByteArrayLiteral("CachyBridgePairRequest/1");
 
 QString setupControlServerName() {
     return QStringLiteral("cachybridge-setup-control-%1")
@@ -95,7 +110,10 @@ public:
         item_.setToolTipSubTitle(QStringLiteral("Double-click to open setup"));
         // Cover all normal application exits, including one initiated by the
         // desktop shell. The explicit menu action below reaches this path too.
-        connect(&application_, &QCoreApplication::aboutToQuit, this, [this] { stopSharing(); });
+        connect(&application_, &QCoreApplication::aboutToQuit, this, [this] {
+            stopPairingAvailability();
+            stopSharing();
+        });
 
         auto *menu = new QMenu;
         menu->addAction(QStringLiteral("Open CachyBridge setup"), this,
@@ -138,12 +156,170 @@ public:
                 }
             });
 
+        enableClientPairingDiscovery();
+
         if (settings.value(QStringLiteral("startup/enabled"), false).toBool()) {
             QTimer::singleShot(3000, this, [this] { restoreSavedSession(); });
         }
     }
 
 private:
+    static QString pairedPeerIdFromOutput(const QByteArray &output) {
+        for (const QByteArray &line : output.split('\n')) {
+            static constexpr auto prefix = "paired_peer_id=";
+            if (!line.startsWith(prefix))
+                continue;
+            const QString peerId = QString::fromUtf8(line.sliced(int(strlen(prefix)))).trimmed();
+            if (peerId.size() == 32)
+                return peerId;
+        }
+        return {};
+    }
+
+    void enableClientPairingDiscovery() {
+        QSettings settings = setupSettings();
+        if (settings.value(QStringLiteral("startup/role")).toString() != QStringLiteral("client"))
+            return;
+        const QString cli = bundledCliPath();
+        if (cli.isEmpty())
+            return;
+        pairingRequests_ = new QUdpSocket(this);
+        if (!pairingRequests_->bind(QHostAddress::AnyIPv4, pairingPort,
+                                    QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint)) {
+            pairingRequests_->deleteLater();
+            pairingRequests_ = nullptr;
+            return;
+        }
+        connect(pairingRequests_, &QUdpSocket::readyRead, this, [this] { readPairingRequests(); });
+        pairingAdvertiser_ = new QProcess(this);
+        pairingAdvertiser_->start(cli, {QStringLiteral("pair-advertise"),
+            QStringLiteral("--local-name"), QSysInfo::machineHostName(),
+            QStringLiteral("--pairing-port"), QString::number(pairingPort)});
+    }
+
+    void stopPairingAvailability() {
+        if (pairingRequests_) {
+            pairingRequests_->close();
+            pairingRequests_ = nullptr;
+        }
+        if (pairingAdvertiser_ && pairingAdvertiser_->state() != QProcess::NotRunning) {
+            pairingAdvertiser_->terminate();
+            if (!pairingAdvertiser_->waitForFinished(500))
+                pairingAdvertiser_->kill();
+        }
+        if (pairingProcess_ && pairingProcess_->state() != QProcess::NotRunning)
+            pairingProcess_->kill();
+    }
+
+    void readPairingRequests() {
+        while (pairingRequests_ && pairingRequests_->hasPendingDatagrams()) {
+            const QNetworkDatagram request = pairingRequests_->receiveDatagram();
+            if (request.data().trimmed() == pairingRequest)
+                showClientPairingCode();
+        }
+    }
+
+    void showClientPairingCode() {
+        if (pairingProcess_) {
+            if (pairingDialog_) {
+                pairingDialog_->showNormal();
+                pairingDialog_->raise();
+                pairingDialog_->activateWindow();
+            }
+            return;
+        }
+        const QString cli = bundledCliPath();
+        QProcess generator;
+        generator.start(cli, {QStringLiteral("pair-code")});
+        if (!generator.waitForStarted() || !generator.waitForFinished(5'000)
+            || generator.exitStatus() != QProcess::NormalExit || generator.exitCode() != 0) {
+            QMessageBox::warning(nullptr, QStringLiteral("Could not start pairing"),
+                QStringLiteral("CachyBridge could not create a one-time pairing code."));
+            return;
+        }
+        const QString code = QString::fromUtf8(generator.readAllStandardOutput()).trimmed();
+        if (code.size() != 5)
+            return;
+
+        pairingDialog_ = new QDialog;
+        pairingDialog_->setAttribute(Qt::WA_DeleteOnClose);
+        pairingDialog_->setWindowTitle(QStringLiteral("CachyBridge pairing code"));
+        pairingDialog_->setMinimumWidth(520);
+        auto *layout = new QVBoxLayout(pairingDialog_);
+        auto *heading = new QLabel(QStringLiteral("Enter this code on the host iMac"));
+        heading->setAlignment(Qt::AlignCenter);
+        auto *codeLabel = new QLabel(code);
+        QFont codeFont = codeLabel->font();
+        codeFont.setPointSize(std::max(codeFont.pointSize() + 30, 48));
+        codeFont.setBold(true);
+        codeLabel->setFont(codeFont);
+        codeLabel->setAlignment(Qt::AlignCenter);
+        codeLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        auto *hint = new QLabel(QStringLiteral(
+            "This one-time code expires in five minutes. Keep this tray open while pairing."));
+        hint->setWordWrap(true);
+        hint->setAlignment(Qt::AlignCenter);
+        auto *cancel = new QPushButton(QStringLiteral("Cancel pairing"));
+        layout->addWidget(heading);
+        layout->addWidget(codeLabel);
+        layout->addWidget(hint);
+        layout->addWidget(cancel);
+        connect(cancel, &QPushButton::clicked, pairingDialog_, &QDialog::reject);
+        connect(pairingDialog_, &QDialog::finished, this, [this](int) {
+            if (pairingProcess_ && pairingProcess_->state() != QProcess::NotRunning)
+                pairingProcess_->kill();
+            pairingDialog_ = nullptr;
+        });
+        pairingDialog_->show();
+        pairingDialog_->raise();
+        pairingDialog_->activateWindow();
+
+        const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
+        if (!systemctl.isEmpty()) {
+            QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"),
+                QStringLiteral("cachybridge-seamless-client")});
+        }
+        pairingProcess_ = new QProcess(this);
+        pairingProcess_->start(cli, {QStringLiteral("pair-client"),
+            QStringLiteral("--listen"), QStringLiteral("0.0.0.0:45232"),
+            QStringLiteral("--code"), code,
+            QStringLiteral("--local-name"), QSysInfo::machineHostName(),
+            QStringLiteral("--persistent-permissions")});
+        if (!pairingProcess_->waitForStarted()) {
+            pairingDialog_->reject();
+            pairingProcess_->deleteLater();
+            pairingProcess_ = nullptr;
+            QMessageBox::warning(nullptr, QStringLiteral("Could not start pairing"),
+                QStringLiteral("CachyBridge could not open the client pairing listener."));
+            return;
+        }
+        QProcess *process = pairingProcess_;
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [this, process](int exitCode, QProcess::ExitStatus status) {
+                const QString peerId = pairedPeerIdFromOutput(process->readAllStandardOutput());
+                const QString details = QString::fromUtf8(process->readAllStandardError()).trimmed();
+                if (pairingProcess_ == process)
+                    pairingProcess_ = nullptr;
+                process->deleteLater();
+                if (pairingDialog_)
+                    pairingDialog_->accept();
+                if (status != QProcess::NormalExit || exitCode != 0 || peerId.isEmpty()) {
+                    if (!details.isEmpty())
+                        QMessageBox::warning(nullptr, QStringLiteral("Pairing did not complete"), details);
+                    return;
+                }
+                QSettings settings = setupSettings();
+                const auto *screen = QGuiApplication::primaryScreen();
+                const QSize local = screen ? screen->size() : QSize(2560, 1440);
+                settings.setValue(QStringLiteral("startup/peer-id"), peerId);
+                settings.setValue(QStringLiteral("startup/role"), QStringLiteral("client"));
+                settings.setValue(QStringLiteral("startup/peer-width"), local.width());
+                settings.setValue(QStringLiteral("startup/peer-height"), local.height());
+                settings.sync();
+                QTimer::singleShot(250, this, [this] { restoreSavedSession(); });
+            });
+    }
+
     void stopSharing() const {
         const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
         if (systemctl.isEmpty())
@@ -221,6 +397,10 @@ private:
     QApplication &application_;
     KStatusNotifierItem item_;
     QElapsedTimer lastActivation_;
+    QUdpSocket *pairingRequests_ = nullptr;
+    QProcess *pairingAdvertiser_ = nullptr;
+    QProcess *pairingProcess_ = nullptr;
+    QPointer<QDialog> pairingDialog_;
 };
 
 } // namespace

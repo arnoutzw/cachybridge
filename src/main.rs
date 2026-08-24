@@ -132,6 +132,16 @@ enum Command {
         #[arg(long, default_value_t = 2)]
         timeout_seconds: u64,
     },
+    /// Advertise an open client tray as ready for host-led pairing. The tray
+    /// owns the matching UDP code-request listener on this same port.
+    PairAdvertise {
+        /// Friendly name shown in the host's nearby-client list.
+        #[arg(long)]
+        local_name: String,
+        /// TCP/UDP port reserved by the client tray for pairing requests.
+        #[arg(long, default_value_t = DEFAULT_PAIRING_PORT)]
+        pairing_port: u16,
+    },
     /// Run on the input-owner host: connect to a client displaying a one-time
     /// pairing code. This stores the received long-term key locally.
     PairHost {
@@ -548,6 +558,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Command::PairAdvertise {
+            local_name,
+            pairing_port,
+        } => run_pair_advertise(pairing_port, local_name),
         Command::PairHost {
             connect,
             code,
@@ -912,6 +926,18 @@ fn run_pair_client(
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+fn run_pair_advertise(
+    pairing_port: u16,
+    local_name: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _advertiser = discovery::Advertiser::start(pairing_port, local_name)?;
+    // The tray owns this helper and terminates it when the tray closes. Keep
+    // the advertiser alive without opening a TCP listener or generating code.
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
     }
 }
 
@@ -1876,6 +1902,17 @@ mod tests {
             Cli::try_parse_from(["cachybridge", "pair-code"]),
             Ok(Cli {
                 command: Command::PairCode
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cachybridge",
+                "pair-advertise",
+                "--local-name",
+                "Client iMac",
+            ]),
+            Ok(Cli {
+                command: Command::PairAdvertise { .. }
             })
         ));
         assert!(matches!(
