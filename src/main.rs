@@ -841,6 +841,10 @@ fn run_pair_client(
                     connection.send_payload(&pairing::encode_grant(&grant)?)?;
                     bridge_config.add_peer(peer)?;
                     config::save(&config_path, &bridge_config)?;
+                    println!(
+                        "paired_peer_id={}",
+                        bridge_config.peers.last().expect("peer was added").id
+                    );
                     Ok(())
                 })();
                 match result {
@@ -915,6 +919,10 @@ fn run_pair_host(
     )?;
     bridge_config.add_peer(peer)?;
     config::save(&path, &bridge_config)?;
+    println!(
+        "paired_peer_id={}",
+        bridge_config.peers.last().expect("peer was added").id
+    );
     println!(
         "paired client; saved private configuration at {}",
         path.display()
@@ -1230,7 +1238,7 @@ fn run_seamless_host_with_capture(
     capture: seamless::InputCaptureAdapter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connecting seamless host to client at {peer}");
-    let stream = TcpStream::connect(peer)?;
+    let stream = connect_seamless_peer(peer, Duration::from_secs(8))?;
     let connection = SecureConnection::connect(stream, Role::Host, &psk)?;
     connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
     let controller = handoff::HandoffController::new(local, remote, handoff::Edge::Left);
@@ -1254,6 +1262,29 @@ fn run_seamless_host_with_capture(
     forward_result?;
     release_result?;
     Ok(())
+}
+
+/// Pairing saves the client configuration before its GUI starts the regular
+/// listener. Allow that handoff to complete instead of failing the host on a
+/// harmless, short-lived connection refusal.
+fn connect_seamless_peer(peer: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match TcpStream::connect(peer) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::ConnectionAborted
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn run_seamless_host_config(

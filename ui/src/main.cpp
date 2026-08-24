@@ -28,7 +28,9 @@
 #include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
+#include <QTabWidget>
 #include <QTextStream>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -92,6 +94,26 @@ struct PairJoinDraft {
     Placement placement = Placement::Left;
     bool persistentPermissions = false;
 };
+
+bool isPeerId(const QString &value) {
+    return value.size() == 32 && std::all_of(value.cbegin(), value.cend(), [](QChar character) {
+        return character.isDigit()
+            || (character >= u'a' && character <= u'f')
+            || (character >= u'A' && character <= u'F');
+    });
+}
+
+QString pairedPeerIdFromOutput(const QString &output) {
+    for (const QString &line : output.split(u'\n', Qt::SkipEmptyParts)) {
+        constexpr auto prefix = "paired_peer_id=";
+        if (line.startsWith(QLatin1String(prefix))) {
+            const QString id = line.sliced(int(std::char_traits<char>::length(prefix))).trimmed();
+            if (isPeerId(id))
+                return id;
+        }
+    }
+    return {};
+}
 
 QString detectedLanCidr() {
     QProcess process;
@@ -284,7 +306,7 @@ public:
     virtual QString generatePairingCode(QString *error) = 0;
     virtual QString startPairClient(const SetupDraft &draft, const QString &code,
                                     QProcess *process) = 0;
-    virtual QString connectPairHost(const PairJoinDraft &draft) = 0;
+    virtual QString connectPairHost(const PairJoinDraft &draft, QString *peerId) = 0;
     virtual QStringList discoverPairClients(QString *error) = 0;
     virtual QString ensureClientFirewall() = 0;
     virtual QString save(const SetupDraft &draft) = 0;
@@ -376,7 +398,7 @@ public:
         return {};
     }
 
-    QString connectPairHost(const PairJoinDraft &draft) override {
+    QString connectPairHost(const PairJoinDraft &draft, QString *peerId) override {
         QProcess process;
         QStringList arguments{
             QStringLiteral("pair-host"), QStringLiteral("--connect"), draft.clientAddress,
@@ -397,6 +419,12 @@ public:
         if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
             return details.isEmpty() ? QStringLiteral("Pairing was rejected or expired.") : details;
+        }
+        *peerId = pairedPeerIdFromOutput(QString::fromUtf8(process.readAllStandardOutput()));
+        if (peerId->isEmpty()) {
+            logSetupDiagnostic(QStringLiteral("pair-host missing peer id"),
+                QStringLiteral("program=%1").arg(cachybridge_));
+            return QStringLiteral("Pairing completed but did not return a usable peer ID.");
         }
         return {};
     }
@@ -551,15 +579,20 @@ public:
         tokenRow->addWidget(generateSecret);
         tokenRow->addWidget(showSecret);
         form->addRow(QStringLiteral("Pairing PSK / token"), tokenRow);
-        auto *manualPairing = new QGroupBox(QStringLiteral("Advanced manual pairing"));
-        manualPairing->setCheckable(true);
-        manualPairing->setChecked(false);
-        manualPairing->setToolTip(QStringLiteral(
+        auto *manualPairing = new QWidget;
+        auto *manualLayout = new QVBoxLayout(manualPairing);
+        manualLayout->setContentsMargins(12, 12, 12, 12);
+        auto *manualHeading = new QLabel(QStringLiteral("Advanced manual pairing"));
+        manualHeading->setToolTip(QStringLiteral(
             "Use only for recovery or an explicitly managed PSK. Normal setup uses a short one-time code."));
-        manualPairing->setLayout(form);
+        manualLayout->addWidget(manualHeading);
+        manualLayout->addLayout(form);
 
-        auto *easyPairing = new QGroupBox(QStringLiteral("Easy one-time pairing (recommended)"));
+        auto *easyPairing = new QWidget;
         auto *easyLayout = new QVBoxLayout(easyPairing);
+        easyLayout->setContentsMargins(12, 12, 12, 12);
+        auto *easyHeading = new QLabel(QStringLiteral("Pair with a five-character, single-use code"));
+        easyLayout->addWidget(easyHeading);
         auto *hostButton = new QPushButton(QStringLiteral("Show one-time code on this client iMac"));
         hostButton->setToolTip(QStringLiteral(
             "Starts a five-minute listener. On the input-owner host, enter this client's LAN address and the displayed code."));
@@ -600,15 +633,24 @@ public:
             connect(hostPairingProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this, hostButton](int exitCode, QProcess::ExitStatus status) {
                     const QString details = QString::fromUtf8(hostPairingProcess_->readAllStandardError()).trimmed();
+                    const QString peerId = pairedPeerIdFromOutput(
+                        QString::fromUtf8(hostPairingProcess_->readAllStandardOutput()));
                     hostPairingProcess_->deleteLater();
                     hostPairingProcess_ = nullptr;
                     hostButton->setEnabled(true);
-                    if (status == QProcess::NormalExit && exitCode == 0)
-                        QMessageBox::information(this, QStringLiteral("Pairing complete"),
-                            QStringLiteral("The input-owner host was saved on this client iMac with private permissions."));
-                    else
+                    if (status == QProcess::NormalExit && exitCode == 0 && !peerId.isEmpty()) {
+                        const QString serviceError = startClientSession(peerId);
+                        if (serviceError.isEmpty()) {
+                            QMessageBox::information(this, QStringLiteral("Client ready"),
+                                QStringLiteral("Pairing is complete and this iMac is now listening for the host."));
+                        } else {
+                            QMessageBox::warning(this, QStringLiteral("Pairing saved, client not started"),
+                                serviceError);
+                        }
+                    } else {
                         QMessageBox::warning(this, QStringLiteral("Pairing ended"),
                             details.isEmpty() ? QStringLiteral("The code expired or pairing was not completed.") : details);
+                    }
                 });
         });
         auto *joinButton = new QPushButton(QStringLiteral("Connect host to client with code"));
@@ -620,13 +662,27 @@ public:
                     QStringLiteral("Enter this host's name, the client address, and its displayed code."));
                 return;
             }
-            const QString error = store_->connectPairHost(draft);
+            QString peerId;
+            const QString error = store_->connectPairHost(draft, &peerId);
             if (!error.isEmpty()) {
                 QMessageBox::warning(this, QStringLiteral("Could not join"), error);
                 return;
             }
             QMessageBox::information(this, QStringLiteral("Pairing complete"),
-                QStringLiteral("The client was saved on this host iMac with private permissions."));
+                QStringLiteral("Pairing was saved. Starting the sharing session now…"));
+            // The client pairing process switches into its regular listener
+            // immediately after it exits. Give that service a short head start
+            // before the host requests portal capture and connects.
+            QTimer::singleShot(1500, this, [this, peerId] {
+                const QString serviceError = startHostSession(peerId);
+                if (!serviceError.isEmpty()) {
+                    QMessageBox::warning(this, QStringLiteral("Pairing saved, host not started"),
+                        serviceError);
+                    return;
+                }
+                QMessageBox::information(this, QStringLiteral("CachyBridge connected"),
+                    QStringLiteral("The host session has started. Approve a desktop-portal prompt if Plasma shows one."));
+            });
         });
         auto *joinForm = new QFormLayout;
         joinForm->addRow(QStringLiteral("Client address"), pairingAddress_);
@@ -664,8 +720,9 @@ public:
         hostConnectLayout->addWidget(joinButton);
         easyLayout->addWidget(hostConnectPanel_);
 
-        auto *placementBox = new QGroupBox(QStringLiteral("Client placement"));
+        auto *placementBox = new QWidget;
         auto *placementLayout = new QVBoxLayout(placementBox);
+        placementLayout->setContentsMargins(12, 12, 12, 12);
         auto *hint = new QLabel(QStringLiteral(
             "Drag the client tile to an edge of the host tile. Tile sizes reflect the selected display resolutions."));
         hint->setWordWrap(true);
@@ -696,6 +753,7 @@ public:
             QStringLiteral("Remember desktop portal permissions (recommended on these two iMacs)"));
         persistent_->setToolTip(QStringLiteral(
             "Stores portal-issued single-use restore tokens in the private CachyBridge configuration."));
+        easyLayout->addWidget(persistent_);
 
         auto *saveButton = new QPushButton(QStringLiteral("Save manual pairing"));
         saveButton->setDefault(true);
@@ -706,23 +764,90 @@ public:
         actions->addStretch();
         actions->addWidget(cancel);
         actions->addWidget(saveButton);
+        manualLayout->addStretch();
+        manualLayout->addLayout(actions);
 
         auto *layout = new QVBoxLayout(this);
         layout->addWidget(heading);
         layout->addWidget(intro);
         layout->addSpacing(8);
-        layout->addWidget(easyPairing);
-        layout->addWidget(manualPairing);
-        layout->addWidget(placementBox);
-        layout->addWidget(persistent_);
-        layout->addLayout(actions);
+        auto *tabs = new QTabWidget;
+        tabs->addTab(easyPairing, QStringLiteral("Easy pairing"));
+        tabs->addTab(manualPairing, QStringLiteral("Manual pairing"));
+        tabs->addTab(placementBox, QStringLiteral("Client placement"));
+        layout->addWidget(tabs, 1);
 
         hostButton->setVisible(role_ == MachineRole::Client);
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
-        placementBox->setVisible(role_ == MachineRole::Host);
+        tabs->setTabEnabled(2, role_ == MachineRole::Host);
     }
 
 private:
+    QSize logicalScreenSize() const {
+        const auto *screen = QGuiApplication::primaryScreen();
+        return screen ? screen->size() : QSize(2560, 1440);
+    }
+
+    QString startUserService(const QString &unit, const QStringList &command) const {
+        const QString systemdRun = QStandardPaths::findExecutable(QStringLiteral("systemd-run"));
+        const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
+        if (systemdRun.isEmpty() || systemctl.isEmpty())
+            return QStringLiteral("systemd user services are not available on this desktop.");
+
+        // Re-pairing replaces an old session safely: the old portal process is
+        // stopped first, which releases any captured buttons and keys.
+        QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"), unit});
+
+        QStringList arguments{
+            QStringLiteral("--user"), QStringLiteral("--unit=") + unit,
+            QStringLiteral("--collect"), QStringLiteral("--property=Restart=no"),
+        };
+        for (const QString &name : {QStringLiteral("XDG_RUNTIME_DIR"),
+                                    QStringLiteral("DBUS_SESSION_BUS_ADDRESS"),
+                                    QStringLiteral("XDG_SESSION_TYPE"),
+                                    QStringLiteral("WAYLAND_DISPLAY")}) {
+            const QString value = qEnvironmentVariable(name.toUtf8().constData());
+            if (!value.isEmpty())
+                arguments << QStringLiteral("--setenv=") + name + u'=' + value;
+        }
+        arguments << bundledCliPath() << command;
+
+        QProcess process;
+        process.start(systemdRun, arguments);
+        if (!process.waitForStarted() || !process.waitForFinished(5000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const QString details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            const QString reason = details.isEmpty() ? process.errorString() : details;
+            logSetupDiagnostic(QStringLiteral("service launch failed"),
+                QStringLiteral("unit=%1 program=%2 reason=%3").arg(unit, systemdRun, reason));
+            return QStringLiteral("Could not start %1: %2").arg(unit, reason);
+        }
+        logSetupDiagnostic(QStringLiteral("service launched"), QStringLiteral("unit=%1").arg(unit));
+        return {};
+    }
+
+    QString startClientSession(const QString &peerId) const {
+        const QSize size = logicalScreenSize();
+        return startUserService(QStringLiteral("cachybridge-seamless-client"), {
+            QStringLiteral("seamless-client-config"), QStringLiteral("--peer"), peerId,
+            QStringLiteral("--peer-width"), QString::number(size.width()),
+            QStringLiteral("--peer-y"), QStringLiteral("0"),
+        });
+    }
+
+    QString startHostSession(const QString &peerId) const {
+        const QSize local = logicalScreenSize();
+        const QSize remote(clientWidth_->value(), clientHeight_->value());
+        return startUserService(QStringLiteral("cachybridge-seamless-host"), {
+            QStringLiteral("seamless-host-config"), QStringLiteral("--peer"), peerId,
+            QStringLiteral("--local-width"), QString::number(local.width()),
+            QStringLiteral("--local-height"), QString::number(local.height()),
+            QStringLiteral("--peer-width"), QString::number(remote.width()),
+            QStringLiteral("--peer-height"), QString::number(remote.height()),
+            QStringLiteral("--peer-y"), QStringLiteral("0"),
+        });
+    }
+
     Placement selectedPlacement() const {
         return placementPreview_->placement();
     }
