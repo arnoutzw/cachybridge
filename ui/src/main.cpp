@@ -270,6 +270,7 @@ private:
         auto *hostTile = scene_.addRect(hostRect, QPen(palette().highlight(), 2), QBrush(palette().base()));
         auto *hostLabel = scene_.addSimpleText(
             QStringLiteral("Host\n%1 × %2").arg(hostResolution_.width()).arg(hostResolution_.height()));
+        hostLabel->setBrush(QBrush(Qt::white));
         hostLabel->setPos(hostRect.center() - hostLabel->boundingRect().center());
         hostLabel->setParentItem(hostTile);
 
@@ -280,13 +281,15 @@ private:
         scene_.addItem(clientTile_);
         auto *clientLabel = scene_.addSimpleText(
             QStringLiteral("Client\n%1 × %2").arg(clientResolution_.width()).arg(clientResolution_.height()));
+        clientLabel->setBrush(QBrush(Qt::white));
         clientLabel->setPos(clientRect.center() - clientLabel->boundingRect().center());
         clientLabel->setParentItem(clientTile_);
 
         placeClient(hostRect, clientRect);
         hostRect_ = hostRect;
-        scene_.setSceneRect(-client.width() - 40, -client.height() - 40,
-            host.width() + client.width() * 2 + 80, host.height() + client.height() * 2 + 80);
+        // Fit the actual display arrangement, not a fixed symmetric canvas:
+        // this keeps both tiles centered after the client is moved left/right.
+        scene_.setSceneRect(scene_.itemsBoundingRect().adjusted(-40, -40, 40, 40));
         fitInView(scene_.sceneRect(), Qt::KeepAspectRatio);
     }
 
