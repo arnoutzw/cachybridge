@@ -21,6 +21,9 @@
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMessageBox>
+#include <QImage>
+#include <QPixmap>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QSaveFile>
@@ -749,55 +752,11 @@ public:
         intro->setWordWrap(true);
 
         hostName_ = new QLineEdit(QSysInfo::machineHostName());
-        hostEndpoint_ = new QLineEdit(QStringLiteral("127.0.0.1:45231"));
-        clientName_ = new QLineEdit(QStringLiteral("Client iMac"));
-        clientEndpoint_ = new QLineEdit(QStringLiteral("127.0.0.1:45231"));
-        pairingPsk_ = new QLineEdit;
-        pairingPsk_->setEchoMode(QLineEdit::Password);
-        pairingPsk_->setMaxLength(64);
-        pairingPsk_->setPlaceholderText(QStringLiteral("64 hexadecimal characters"));
-
         pairingCode_ = new QLineEdit;
         pairingCode_->setPlaceholderText(QStringLiteral("ABCDE"));
         pairingCode_->setMaxLength(5);
         pairingAddress_ = new QLineEdit;
         pairingAddress_->setPlaceholderText(QStringLiteral("Client address, e.g. 192.168.2.24:45232"));
-
-        auto *generateSecret = new QPushButton(QStringLiteral("Generate token"));
-        connect(generateSecret, &QPushButton::clicked, this, [this] {
-            QString error;
-            const QString token = store_->generatePairingToken(&error);
-            if (!error.isEmpty()) {
-                QMessageBox::critical(this, QStringLiteral("Could not generate token"), error);
-                return;
-            }
-            pairingPsk_->setText(token);
-            pairingPsk_->setFocus();
-        });
-
-        auto *showSecret = new QCheckBox(QStringLiteral("Show token"));
-        connect(showSecret, &QCheckBox::toggled, this, [this](bool checked) {
-            pairingPsk_->setEchoMode(checked ? QLineEdit::Normal : QLineEdit::Password);
-        });
-
-        auto *form = new QFormLayout;
-        form->addRow(QStringLiteral("Host name"), hostName_);
-        form->addRow(QStringLiteral("Host IP and port"), hostEndpoint_);
-        form->addRow(QStringLiteral("Client name"), clientName_);
-        form->addRow(QStringLiteral("Client IP and port"), clientEndpoint_);
-        auto *tokenRow = new QHBoxLayout;
-        tokenRow->addWidget(pairingPsk_, 1);
-        tokenRow->addWidget(generateSecret);
-        tokenRow->addWidget(showSecret);
-        form->addRow(QStringLiteral("Pairing PSK / token"), tokenRow);
-        auto *manualPairing = new QWidget;
-        auto *manualLayout = new QVBoxLayout(manualPairing);
-        manualLayout->setContentsMargins(12, 12, 12, 12);
-        auto *manualHeading = new QLabel(QStringLiteral("Advanced manual pairing"));
-        manualHeading->setToolTip(QStringLiteral(
-            "Use only for recovery or an explicitly managed PSK. Normal setup uses a short one-time code."));
-        manualLayout->addWidget(manualHeading);
-        manualLayout->addLayout(form);
 
         auto *easyPairing = new QWidget;
         auto *easyLayout = new QVBoxLayout(easyPairing);
@@ -852,8 +811,7 @@ public:
                 QMessageBox::critical(this, QStringLiteral("Could not create code"), error);
                 return;
             }
-            SetupDraft draft{hostName_->text().trimmed(), hostEndpoint_->text().trimmed(),
-                clientName_->text().trimmed(), clientEndpoint_->text().trimmed(), QString(),
+            SetupDraft draft{hostName_->text().trimmed(), {}, {}, {}, {},
                 selectedPlacement(), persistent_->isChecked()};
             hostPairingProcess_ = new QProcess(this);
             const QString startError = store_->startPairClient(draft, code, hostPairingProcess_);
@@ -1103,17 +1061,113 @@ public:
             "Stores portal-issued single-use restore tokens in the private CachyBridge configuration."));
         easyLayout->addWidget(persistent_);
 
-        auto *saveButton = new QPushButton(QStringLiteral("Save manual pairing"));
-        saveButton->setDefault(true);
-        auto *cancel = new QPushButton(QStringLiteral("Cancel"));
-        connect(cancel, &QPushButton::clicked, this, &QWidget::close);
-        connect(saveButton, &QPushButton::clicked, this, [this] { save(); });
-        auto *actions = new QHBoxLayout;
-        actions->addStretch();
-        actions->addWidget(cancel);
-        actions->addWidget(saveButton);
-        manualLayout->addStretch();
-        manualLayout->addLayout(actions);
+        auto *clipboardViewer = new QWidget;
+        auto *clipboardLayout = new QVBoxLayout(clipboardViewer);
+        clipboardLayout->setContentsMargins(12, 12, 12, 12);
+        auto *clipboardHeading = new QLabel(QStringLiteral("Current local clipboard"));
+        QFont clipboardFont = clipboardHeading->font();
+        clipboardFont.setBold(true);
+        clipboardHeading->setFont(clipboardFont);
+        auto *clipboardHint = new QLabel(QStringLiteral(
+            "This is the item CachyBridge can send to the paired iMac. Text and file lists are shown below; images are previewed."));
+        clipboardHint->setWordWrap(true);
+        auto *clipboardSummary = new QLabel;
+        clipboardSummary->setWordWrap(true);
+        clipboardSummary->setStyleSheet(QStringLiteral(
+            "QLabel { padding: 8px; border-radius: 6px; background: palette(alternate-base); }"));
+        auto *clipboardPreview = new QPlainTextEdit;
+        clipboardPreview->setReadOnly(true);
+        clipboardPreview->setPlaceholderText(QStringLiteral("Nothing to display yet."));
+        clipboardPreview->setMinimumHeight(180);
+        auto *clipboardImage = new QLabel;
+        clipboardImage->setAlignment(Qt::AlignCenter);
+        clipboardImage->setMinimumHeight(180);
+        clipboardImage->setVisible(false);
+        auto *refreshClipboard = new QPushButton(QStringLiteral("Refresh clipboard"));
+        const auto showClipboard = [clipboardSummary, clipboardPreview, clipboardImage] {
+            const QString wlPaste = clipboardToolPath(QStringLiteral("wl-paste"));
+            clipboardImage->clear();
+            clipboardImage->setVisible(false);
+            clipboardPreview->setVisible(true);
+            clipboardPreview->clear();
+            if (wlPaste.isEmpty()) {
+                clipboardSummary->setText(QStringLiteral(
+                    "Clipboard support is not installed. Install wl-clipboard from Easy pairing first."));
+                return;
+            }
+            QProcess typesProcess;
+            typesProcess.start(wlPaste, {QStringLiteral("--list-types")});
+            if (!typesProcess.waitForStarted() || !typesProcess.waitForFinished(1000)
+                || typesProcess.exitStatus() != QProcess::NormalExit || typesProcess.exitCode() != 0) {
+                clipboardSummary->setText(QStringLiteral("The local clipboard is currently unavailable."));
+                return;
+            }
+            const QStringList types = QString::fromUtf8(typesProcess.readAllStandardOutput())
+                .split(u'\n', Qt::SkipEmptyParts);
+            if (types.isEmpty()) {
+                clipboardSummary->setText(QStringLiteral("The local clipboard is empty."));
+                return;
+            }
+            QString mime;
+            if (types.contains(QStringLiteral("text/uri-list")))
+                mime = QStringLiteral("text/uri-list");
+            else {
+                for (const QString &candidate : {QStringLiteral("text/plain"),
+                                                  QStringLiteral("text/plain;charset=utf-8"),
+                                                  QStringLiteral("image/png"),
+                                                  QStringLiteral("image/jpeg"),
+                                                  QStringLiteral("image/webp")}) {
+                    if (types.contains(candidate)) {
+                        mime = candidate;
+                        break;
+                    }
+                }
+            }
+            if (mime.isEmpty()) {
+                clipboardSummary->setText(QStringLiteral("Clipboard type is not shared by CachyBridge: %1")
+                    .arg(types.join(QStringLiteral(", "))));
+                return;
+            }
+            QProcess contentProcess;
+            contentProcess.start(wlPaste, {QStringLiteral("--no-newline"),
+                                           QStringLiteral("--type"), mime});
+            if (!contentProcess.waitForStarted() || !contentProcess.waitForFinished(1500)
+                || contentProcess.exitStatus() != QProcess::NormalExit || contentProcess.exitCode() != 0) {
+                clipboardSummary->setText(QStringLiteral("Could not read the %1 clipboard item.").arg(mime));
+                return;
+            }
+            const QByteArray content = contentProcess.readAllStandardOutput();
+            if (mime.startsWith(QStringLiteral("image/"))) {
+                QImage image;
+                if (!image.loadFromData(content)) {
+                    clipboardSummary->setText(QStringLiteral("Image clipboard (%1, %2 bytes) could not be previewed.")
+                        .arg(mime).arg(content.size()));
+                    return;
+                }
+                clipboardSummary->setText(QStringLiteral("Image clipboard: %1 × %2 pixels (%3, %4 bytes)")
+                    .arg(image.width()).arg(image.height()).arg(mime).arg(content.size()));
+                clipboardImage->setPixmap(QPixmap::fromImage(image).scaled(
+                    520, 320, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                clipboardPreview->setVisible(false);
+                clipboardImage->setVisible(true);
+                return;
+            }
+            const QString display = QString::fromUtf8(content);
+            constexpr qsizetype previewLimit = 64 * 1024;
+            clipboardSummary->setText(mime == QStringLiteral("text/uri-list")
+                ? QStringLiteral("File clipboard (%1 bytes)").arg(content.size())
+                : QStringLiteral("Text clipboard (%1 bytes)").arg(content.size()));
+            clipboardPreview->setPlainText(display.left(previewLimit)
+                + (display.size() > previewLimit ? QStringLiteral("\n\n[preview truncated]") : QString()));
+        };
+        connect(refreshClipboard, &QPushButton::clicked, this, showClipboard);
+        clipboardLayout->addWidget(clipboardHeading);
+        clipboardLayout->addWidget(clipboardHint);
+        clipboardLayout->addWidget(clipboardSummary);
+        clipboardLayout->addWidget(clipboardPreview, 1);
+        clipboardLayout->addWidget(clipboardImage, 1);
+        clipboardLayout->addWidget(refreshClipboard);
+        showClipboard();
 
         auto *layout = new QVBoxLayout(this);
         layout->addWidget(heading);
@@ -1122,8 +1176,12 @@ public:
         layout->addSpacing(8);
         auto *tabs = new QTabWidget;
         tabs->addTab(easyPairing, QStringLiteral("Easy pairing"));
-        tabs->addTab(manualPairing, QStringLiteral("Manual pairing"));
+        tabs->addTab(clipboardViewer, QStringLiteral("Clipboard"));
         tabs->addTab(placementBox, QStringLiteral("Client placement"));
+        connect(tabs, &QTabWidget::currentChanged, this, [tabs, clipboardViewer, showClipboard](int) {
+            if (tabs->currentWidget() == clipboardViewer)
+                showClipboard();
+        });
 
         auto *connectionDiagnostics = new QWidget;
         auto *diagnosticsLayout = new QVBoxLayout(connectionDiagnostics);
@@ -1281,56 +1339,8 @@ private:
         return QStringLiteral("<this iMac's LAN IP>");
     }
 
-    void save() {
-        const QString token = pairingPsk_->text().trimmed();
-        const auto validName = [](const QString &name) {
-            if (name.isEmpty() || name.size() > 80)
-                return false;
-            for (const QChar character : name) {
-                if (!(character.unicode() < 128 && (character.isLetterOrNumber()
-                      || character == u' ' || character == u'-'
-                      || character == u'_' || character == u'.')))
-                    return false;
-            }
-            return true;
-        };
-        const auto hex = [](QChar character) {
-            const auto value = character.unicode();
-            return (value >= u'0' && value <= u'9')
-                || (value >= u'a' && value <= u'f')
-                || (value >= u'A' && value <= u'F');
-        };
-        if (!validName(hostName_->text().trimmed()) || !validName(clientName_->text().trimmed())) {
-            QMessageBox::warning(this, QStringLiteral("Invalid name"),
-                QStringLiteral("Names must use 1–80 letters, digits, spaces, '.', '_' or '-'."));
-            return;
-        }
-        if (token.size() != 64 || !std::all_of(token.cbegin(), token.cend(), hex)) {
-            QMessageBox::warning(this, QStringLiteral("Invalid pairing token"),
-                QStringLiteral("The pairing token must contain exactly 64 hexadecimal characters."));
-            return;
-        }
-        SetupDraft draft{
-            hostName_->text().trimmed(), hostEndpoint_->text().trimmed(),
-            clientName_->text().trimmed(), clientEndpoint_->text().trimmed(),
-            token, selectedPlacement(), persistent_->isChecked()
-        };
-        const QString error = store_->save(draft);
-        if (!error.isEmpty()) {
-            QMessageBox::critical(this, QStringLiteral("Could not save setup"), error);
-            return;
-        }
-        QMessageBox::information(this, QStringLiteral("CachyBridge is configured"),
-            QStringLiteral("The pairing and display placement were saved with private permissions."));
-        close();
-    }
-
     std::unique_ptr<SetupStore> store_;
     QLineEdit *hostName_ = nullptr;
-    QLineEdit *hostEndpoint_ = nullptr;
-    QLineEdit *clientName_ = nullptr;
-    QLineEdit *clientEndpoint_ = nullptr;
-    QLineEdit *pairingPsk_ = nullptr;
     QLineEdit *pairingCode_ = nullptr;
     QLineEdit *pairingAddress_ = nullptr;
     DisplayLayoutPreview *placementPreview_ = nullptr;
