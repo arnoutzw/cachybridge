@@ -1,7 +1,9 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QCommandLineParser>
+#include <QDateTime>
 #include <QDialog>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -26,6 +28,7 @@
 #include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
+#include <QTextStream>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -46,6 +49,30 @@ QString placementName(Placement placement) {
     case Placement::Below: return QStringLiteral("below");
     }
     return QStringLiteral("left");
+}
+
+void logSetupDiagnostic(const QString &event, const QString &details) {
+    const QString directory = QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation);
+    if (directory.isEmpty() || !QDir().mkpath(directory))
+        return;
+    QFile file(directory + QStringLiteral("/setup.log"));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    QTextStream(&file) << QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+                       << ' ' << event << ": " << details << '\n';
+}
+
+QString bundledCliPath() {
+    const QString adjacent = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/cachybridge");
+    if (QFileInfo(adjacent).isExecutable())
+        return adjacent;
+    const QString discovered = QStandardPaths::findExecutable(QStringLiteral("cachybridge"));
+    if (!discovered.isEmpty())
+        return discovered;
+    return adjacent;
 }
 
 struct SetupDraft {
@@ -302,18 +329,33 @@ public:
     QString generatePairingCode(QString *error) override {
         QProcess process;
         process.start(cachybridge_, {QStringLiteral("pair-code")});
-        if (!process.waitForStarted() || !process.waitForFinished(15000)
+        const bool started = process.waitForStarted();
+        const bool finished = started && process.waitForFinished(15000);
+        if (!started || !finished
             || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
-            *error = details.isEmpty()
-                ? QStringLiteral("The one-time-code generator failed.") : details;
+            const QString reason = details.isEmpty() ? process.errorString() : details;
+            logSetupDiagnostic(QStringLiteral("pair-code failed"),
+                QStringLiteral("program=%1 started=%2 finished=%3 status=%4 exit=%5 reason=%6")
+                    .arg(cachybridge_)
+                    .arg(started)
+                    .arg(finished)
+                    .arg(static_cast<int>(process.exitStatus()))
+                    .arg(process.exitCode())
+                    .arg(reason));
+            *error = QStringLiteral("Could not start the CachyBridge code generator at %1: %2")
+                .arg(cachybridge_, reason);
             return {};
         }
         const QString code = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
         if (code.size() != 5) {
+            logSetupDiagnostic(QStringLiteral("pair-code invalid output"),
+                QStringLiteral("program=%1 length=%2").arg(cachybridge_).arg(code.size()));
             *error = QStringLiteral("The code generator returned an unexpected value.");
             return {};
         }
+        logSetupDiagnostic(QStringLiteral("pair-code succeeded"),
+            QStringLiteral("program=%1").arg(cachybridge_));
         return code;
     }
 
@@ -780,7 +822,7 @@ int main(int argc, char **argv) {
     parser.addHelpOption();
     QCommandLineOption bridgeOption(QStringLiteral("cachybridge"),
         QStringLiteral("Path to the CachyBridge CLI"), QStringLiteral("path"),
-        QStringLiteral("cachybridge"));
+        bundledCliPath());
     QCommandLineOption configOption(QStringLiteral("config"),
         QStringLiteral("Override the v4 configuration file"), QStringLiteral("path"));
     parser.addOption(bridgeOption);
