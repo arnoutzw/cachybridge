@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QCommandLineParser>
+#include <QDialog>
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -34,6 +35,7 @@
 namespace {
 
 enum class Placement { Left, Right, Above, Below };
+enum class MachineRole { Host, Client };
 
 QString placementName(Placement placement) {
     switch (placement) {
@@ -175,6 +177,39 @@ private:
     QSize clientResolution_;
     QRectF hostRect_;
     Placement placement_ = Placement::Left;
+};
+
+class RoleSelectionDialog final : public QDialog {
+public:
+    RoleSelectionDialog() {
+        setWindowTitle(QStringLiteral("CachyBridge — choose this iMac's role"));
+        setModal(true);
+        setMinimumWidth(480);
+        auto *heading = new QLabel(QStringLiteral("What role should this iMac have?"));
+        QFont headingFont = heading->font();
+        headingFont.setPointSize(headingFont.pointSize() + 4);
+        headingFont.setBold(true);
+        heading->setFont(headingFont);
+        auto *host = new QPushButton(QStringLiteral("Host / master\nOwns the physical mouse and keyboard"));
+        auto *client = new QPushButton(QStringLiteral("Client / slave\nReceives shared input from the host"));
+        for (auto *button : {host, client}) {
+            button->setMinimumHeight(76);
+            button->setStyleSheet(QStringLiteral("QPushButton { text-align: left; padding: 12px; }"));
+        }
+        connect(host, &QPushButton::clicked, this, [this] { role_ = MachineRole::Host; accept(); });
+        connect(client, &QPushButton::clicked, this, [this] { role_ = MachineRole::Client; accept(); });
+        auto *layout = new QVBoxLayout(this);
+        layout->addWidget(heading);
+        layout->addWidget(new QLabel(QStringLiteral(
+            "The host connects to the client during pairing and when sharing input.")));
+        layout->addWidget(host);
+        layout->addWidget(client);
+    }
+
+    MachineRole role() const { return role_; }
+
+private:
+    MachineRole role_ = MachineRole::Host;
 };
 
 class SetupStore {
@@ -345,7 +380,8 @@ private:
 
 class SetupWindow final : public QWidget {
 public:
-    explicit SetupWindow(std::unique_ptr<SetupStore> store) : store_(std::move(store)) {
+    explicit SetupWindow(std::unique_ptr<SetupStore> store, MachineRole role)
+        : store_(std::move(store)), role_(role) {
         setWindowTitle(QStringLiteral("CachyBridge Setup"));
         setMinimumWidth(620);
 
@@ -355,10 +391,11 @@ public:
         headingFont.setBold(true);
         heading->setFont(headingFont);
 
-        auto *intro = new QLabel(QStringLiteral(
-            "On the controlled client, show a one-time code. On the input-owner host, "
-            "connect to that client and choose its relative display position. "
-            "No input portal is opened by this setup window."));
+        auto *intro = new QLabel(role_ == MachineRole::Host
+            ? QStringLiteral("Host / master mode: find a client, connect with its code, and place its display. "
+                "No input portal is opened by this setup window.")
+            : QStringLiteral("Client / slave mode: show a code and wait for the host to connect. "
+                "No input portal is opened by this setup window."));
         intro->setWordWrap(true);
 
         hostName_ = new QLineEdit(QSysInfo::machineHostName());
@@ -497,9 +534,13 @@ public:
             pairingAddress_->setText(selected.left(separator));
         });
         easyLayout->addWidget(hostButton);
-        easyLayout->addLayout(joinForm);
-        easyLayout->addWidget(discoverButton);
-        easyLayout->addWidget(joinButton);
+        hostConnectPanel_ = new QWidget;
+        auto *hostConnectLayout = new QVBoxLayout(hostConnectPanel_);
+        hostConnectLayout->setContentsMargins(0, 0, 0, 0);
+        hostConnectLayout->addLayout(joinForm);
+        hostConnectLayout->addWidget(discoverButton);
+        hostConnectLayout->addWidget(joinButton);
+        easyLayout->addWidget(hostConnectPanel_);
 
         auto *placementBox = new QGroupBox(QStringLiteral("Client placement"));
         auto *placementLayout = new QVBoxLayout(placementBox);
@@ -553,6 +594,10 @@ public:
         layout->addWidget(placementBox);
         layout->addWidget(persistent_);
         layout->addLayout(actions);
+
+        hostButton->setVisible(role_ == MachineRole::Client);
+        hostConnectPanel_->setVisible(role_ == MachineRole::Host);
+        placementBox->setVisible(role_ == MachineRole::Host);
     }
 
 private:
@@ -639,6 +684,8 @@ private:
     QSpinBox *clientHeight_ = nullptr;
     QCheckBox *persistent_ = nullptr;
     QProcess *hostPairingProcess_ = nullptr;
+    QWidget *hostConnectPanel_ = nullptr;
+    MachineRole role_;
 };
 
 } // namespace
@@ -660,8 +707,11 @@ int main(int argc, char **argv) {
     parser.addOption(configOption);
     parser.process(application);
 
+    RoleSelectionDialog roleDialog;
+    if (roleDialog.exec() != QDialog::Accepted)
+        return 0;
     SetupWindow window(std::make_unique<CliSetupStore>(
-        parser.value(bridgeOption), parser.value(configOption)));
+        parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
     window.show();
     return application.exec();
 }
