@@ -1207,30 +1207,36 @@ int main(int argc, char **argv) {
     }
 
     RoleSelectionDialog roleDialog;
-    if (roleDialog.exec() != QDialog::Accepted)
-        return 0;
-    SetupWindow window(std::make_unique<CliSetupStore>(
-        parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
-    QObject::connect(&controlServer, &QLocalServer::newConnection, &window, [&] {
+    QWidget *activeSetupWindow = nullptr;
+    QObject::connect(&controlServer, &QLocalServer::newConnection, &application, [&] {
         while (QLocalSocket *socket = controlServer.nextPendingConnection()) {
-            const auto handle = [&application, &window, socket] {
+            const auto handle = [&application, &roleDialog, &activeSetupWindow, socket] {
                 const QByteArray command = socket->readAll().trimmed();
+                QWidget *target = activeSetupWindow
+                    ? activeSetupWindow : static_cast<QWidget *>(&roleDialog);
                 if (command == "activate") {
-                    window.showNormal();
-                    window.raise();
-                    window.activateWindow();
+                    target->showNormal();
+                    target->raise();
+                    target->activateWindow();
                 } else if (command == "quit") {
-                    window.close();
+                    if (activeSetupWindow)
+                        activeSetupWindow->close();
+                    roleDialog.reject();
                     application.quit();
                 }
                 socket->disconnectFromServer();
                 socket->deleteLater();
             };
-            QObject::connect(socket, &QLocalSocket::readyRead, &window, handle);
+            QObject::connect(socket, &QLocalSocket::readyRead, &application, handle);
             if (socket->bytesAvailable() > 0)
                 handle();
         }
     });
+    if (roleDialog.exec() != QDialog::Accepted)
+        return 0;
+    SetupWindow window(std::make_unique<CliSetupStore>(
+        parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
+    activeSetupWindow = &window;
     window.show();
     return application.exec();
 }
