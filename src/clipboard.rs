@@ -228,13 +228,13 @@ fn decode_start(record: &[u8]) -> Result<IncomingTransfer, ClipboardError> {
         return Err(ClipboardError::InvalidRecord);
     }
     let total_bytes = u32::from_be_bytes(record[9..13].try_into().expect("fixed width")) as usize;
-    if total_bytes > MAX_CLIPBOARD_BYTES {
-        return Err(ClipboardError::TooLarge);
-    }
     let mime_type = std::str::from_utf8(&record[13..])
         .map_err(|_| ClipboardError::UnsupportedMime)?
         .to_owned();
     validate_mime(&mime_type)?;
+    if total_bytes > content_size_limit(&mime_type) {
+        return Err(ClipboardError::TooLarge);
+    }
     Ok(IncomingTransfer {
         id,
         mime_type,
@@ -650,18 +650,21 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ClipboardError> {
 
 fn validate_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
     validate_mime(&content.mime_type)?;
-    let limit = if content.mime_type == FILE_TRANSFER_MIME {
-        MAX_FILE_TRANSFER_BYTES
-    } else {
-        MAX_CLIPBOARD_BYTES
-    };
-    if content.bytes.len() > limit {
+    if content.bytes.len() > content_size_limit(&content.mime_type) {
         return Err(ClipboardError::TooLarge);
     }
     if content.mime_type.starts_with("text/") {
         std::str::from_utf8(&content.bytes).map_err(|_| ClipboardError::NonText)?;
     }
     Ok(())
+}
+
+fn content_size_limit(mime_type: &str) -> usize {
+    if mime_type == FILE_TRANSFER_MIME {
+        MAX_FILE_TRANSFER_BYTES
+    } else {
+        MAX_CLIPBOARD_BYTES
+    }
 }
 
 fn validate_mime(mime_type: &str) -> Result<(), ClipboardError> {
@@ -773,6 +776,18 @@ mod tests {
         ];
         let bundle = encode_file_bundle(&files).unwrap();
         assert_eq!(decode_file_bundle(&bundle).unwrap(), files);
+    }
+
+    #[test]
+    fn file_transfer_start_allows_the_separate_file_size_limit() {
+        let source = ClipboardContent {
+            mime_type: FILE_TRANSFER_MIME.to_owned(),
+            bytes: vec![0_u8; MAX_CLIPBOARD_BYTES + 1],
+        };
+        let start = encode_start(9, &source).unwrap();
+        let transfer = decode_start(&start[RECORD_PREFIX.len() + 1..]).unwrap();
+        assert_eq!(transfer.total_bytes, MAX_CLIPBOARD_BYTES + 1);
+        assert_eq!(transfer.mime_type, FILE_TRANSFER_MIME);
     }
 
     #[test]
