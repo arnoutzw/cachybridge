@@ -87,6 +87,9 @@ public:
         item_.setIconByName(QStringLiteral("input-mouse"));
         item_.setToolTipTitle(QStringLiteral("CachyBridge"));
         item_.setToolTipSubTitle(QStringLiteral("Double-click to open setup"));
+        // Cover all normal application exits, including one initiated by the
+        // desktop shell. The explicit menu action below reaches this path too.
+        connect(&application_, &QCoreApplication::aboutToQuit, this, [this] { stopSharing(); });
 
         auto *menu = new QMenu;
         menu->addAction(QStringLiteral("Open CachyBridge setup"), this,
@@ -108,10 +111,6 @@ public:
         });
         menu->addSeparator();
         menu->addAction(QStringLiteral("Quit CachyBridge"), this, [this] {
-            // The sharing service deliberately outlives ordinary setup-window
-            // closes so the tray can keep a session alive. Tray Quit is the
-            // explicit exception: stop either configured role before exiting.
-            stopSharing();
             // The setup window may have been opened from the Start Menu, not
             // by this tray process. Use the local control socket so Quit is a
             // single, predictable action in either case.
