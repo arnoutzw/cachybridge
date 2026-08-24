@@ -1490,7 +1490,12 @@ fn run_seamless_host_with_capture(
     capture: seamless::InputCaptureAdapter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connecting seamless host to client at {peer}");
-    let stream = connect_seamless_peer(peer, Duration::from_secs(8))?;
+    // A client starts two portal sessions before it opens its input listener.
+    // On a fresh GUI pairing Plasma may wait for the user to approve those
+    // sessions, so the old eight-second retry window made a successful pairing
+    // look broken. Keep the initial host session alive long enough for that
+    // consent and listener handoff to complete.
+    let stream = connect_seamless_peer(peer, Duration::from_secs(60))?;
     let connection = SecureConnection::connect(stream, Role::Host, &psk)?;
     connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
     let controller = handoff::HandoffController::new(local, remote, edge);

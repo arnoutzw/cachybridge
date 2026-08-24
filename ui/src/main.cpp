@@ -447,9 +447,9 @@ public:
         process.start(cachybridge_, arguments);
         if (!process.waitForStarted())
             return QStringLiteral("Could not start %1: %2").arg(cachybridge_, process.errorString());
-        if (!process.waitForFinished(15000)) {
+        if (!process.waitForFinished(30000)) {
             process.kill();
-            return QStringLiteral("Pairing timed out. Check the host address and the displayed code.");
+            return QStringLiteral("Pairing timed out. Check the client address, code, and LAN firewall.");
         }
         if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
             const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
@@ -808,10 +808,10 @@ public:
             activePeerId_ = peerId;
             QMessageBox::information(this, QStringLiteral("Pairing complete"),
                 QStringLiteral("Pairing was saved. Starting the sharing session now…"));
-            // The client pairing process switches into its regular listener
-            // immediately after it exits. Give that service a short head start
-            // before the host requests portal capture and connects.
-            QTimer::singleShot(1500, this, [this, peerId] {
+            // The client starts RemoteDesktop and InputCapture portal sessions
+            // before it opens its listener. The host CLI now waits up to a
+            // minute for that listener, which covers a first-use portal prompt.
+            QTimer::singleShot(3000, this, [this, peerId] {
                 const QString serviceError = startHostSession(peerId);
                 if (!serviceError.isEmpty()) {
                     QMessageBox::warning(this, QStringLiteral("Pairing saved, host not started"),

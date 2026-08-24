@@ -228,6 +228,14 @@ impl BridgeConfig {
         {
             return Err(ConfigError::DuplicatePeerId(peer.id));
         }
+        // A one-time pairing creates a fresh PSK by design. Re-pairing the
+        // same controlled desktop must therefore supersede its old record,
+        // otherwise setup leaves a growing list of indistinguishable stale
+        // peers and a later GUI action can select a key the client no longer
+        // accepts. CachyBridge currently supports one host and one client, so
+        // the controlled endpoint is the stable identity for this purpose.
+        self.peers
+            .retain(|existing| existing.client_endpoint != peer.client_endpoint);
         self.peers.push(peer);
         self.validate()
     }
@@ -755,6 +763,19 @@ mod tests {
         )
         .is_err());
         assert!(BridgeConfig::parse("schema_version=4\n\n[[peer]]\nunknown=x\n").is_err());
+    }
+
+    #[test]
+    fn re_pairing_a_controlled_endpoint_replaces_the_stale_key() {
+        let first = peer();
+        let mut replacement = peer();
+        replacement.id = "fedcba9876543210fedcba9876543210".to_owned();
+        replacement.name = "Re-paired left iMac".to_owned();
+        replacement.psk = [8; 32];
+        let mut config = BridgeConfig::default();
+        config.add_peer(first).unwrap();
+        config.add_peer(replacement.clone()).unwrap();
+        assert_eq!(config.peers, vec![replacement]);
     }
 
     #[test]
