@@ -215,6 +215,16 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Run only the encrypted shared-clipboard worker for a configured peer.
+    /// Useful for diagnosing clipboard support without opening input portals.
+    ClipboardSync {
+        /// Configured 32-character peer ID.
+        #[arg(long)]
+        peer: String,
+        /// Use this configuration file instead of the normal per-user path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// List local evdev devices that can be passed to `host --device`.
     Devices,
     /// Probe Wayland portal and libei capabilities without requesting consent.
@@ -624,6 +634,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             placement,
             config: config_override,
         } => run_topology_apply(config_override, &peer, placement.into()),
+        Command::ClipboardSync {
+            peer,
+            config: config_override,
+        } => run_clipboard_sync(config_override, &peer),
         Command::Devices => {
             let devices = list_input_devices();
             if devices.is_empty() {
@@ -1124,6 +1138,19 @@ fn spawn_clipboard_host(peer: config::PeerConfig) {
         }
         std::thread::sleep(Duration::from_secs(2));
     });
+}
+
+fn run_clipboard_sync(
+    config_override: Option<PathBuf>,
+    peer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, _, peer) = configured_peer(config_override, peer_id)?;
+    let address = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CLIPBOARD_PORT);
+    eprintln!("connecting encrypted clipboard sync to {address}");
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    let connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
+    clipboard::run(connection)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
