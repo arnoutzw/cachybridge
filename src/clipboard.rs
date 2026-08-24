@@ -13,14 +13,20 @@ use std::{
 use rand::RngCore;
 use thiserror::Error;
 
-use crate::transport::{SecureConnection, TransportError, MAX_APPLICATION_PAYLOAD};
+use crate::transport::{SecureConnection, TransportError};
 
 const RECORD_PREFIX: &[u8] = b"CBCL2";
 const START_KIND: u8 = 1;
 const CHUNK_KIND: u8 = 2;
 const START_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 1 + 4;
 const CHUNK_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 4;
-const MAX_CHUNK_BYTES: usize = MAX_APPLICATION_PAYLOAD - CHUNK_HEADER_BYTES;
+// `poll_receive_payload` intentionally waits until a complete encrypted record
+// is buffered before consuming it.  A near-64 KiB application record can be
+// larger than an OS's effective TCP receive window, leaving the receiver a few
+// KiB short forever while the sender waits for that window to open.  Keep
+// clipboard records comfortably below the smallest normal socket window so
+// image transfers cannot deadlock at a partial frame boundary.
+const MAX_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(10);
@@ -72,11 +78,16 @@ pub enum ClipboardError {
 pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
     let mut last_value: Option<ClipboardContent> = None;
     let mut incoming: Option<IncomingTransfer> = None;
+    // Keep ownership of the provider we started.  A foreground wl-copy
+    // process can otherwise keep a stale Wayland selection alive after the
+    // user copies a newer value, making a just-received image flip back to an
+    // earlier text selection a few seconds later.
+    let mut provider = None;
     let mut next_poll = Instant::now();
     loop {
         if let Some(record) = connection.poll_receive_payload()? {
             if let Some(content) = receive_record(&record, &mut incoming)? {
-                write_content(&content)?;
+                write_content(&content, &mut provider)?;
                 eprintln!(
                     "clipboard received {} ({} bytes)",
                     content.mime_type,
@@ -88,6 +99,9 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
         if Instant::now() >= next_poll {
             if let Some(content) = read_content()? {
                 if last_value.as_ref() != Some(&content) {
+                    // A user-originated replacement must retire our previous
+                    // provider before it can reassert the stale selection.
+                    stop_provider(&mut provider);
                     send_content(&mut connection, &content)?;
                     eprintln!(
                         "clipboard sent {} ({} bytes)",
@@ -275,38 +289,50 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
     Ok(Some(content))
 }
 
-fn write_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
+fn write_content(
+    content: &ClipboardContent,
+    provider: &mut Option<std::process::Child>,
+) -> Result<(), ClipboardError> {
     validate_content(content)?;
+    stop_provider(provider);
     let mut child = Command::new(clipboard_tool("wl-copy"))
         // wl-copy normally forks into a clipboard-provider daemon. Waiting for
         // the initial process can therefore block forever under systemd's
         // subreaper, which froze our receive loop after its first update. Keep
-        // it in the foreground, return to the sync loop immediately, and reap
-        // that provider asynchronously once a newer clipboard replaces it.
+        // it in the foreground and return to the sync loop immediately. Its
+        // child handle is retained so the next replacement can retire it.
         .args(["--foreground", "--type", &content.mime_type])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(map_command_start)?;
-    child
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| ClipboardError::Command("wl-copy did not accept stdin".to_owned()))?
-        .write_all(&content.bytes)?;
+        .ok_or_else(|| ClipboardError::Command("wl-copy did not accept stdin".to_owned()))?;
+    stdin.write_all(&content.bytes)?;
     // Closing stdin tells wl-copy that it has received the complete item.
-    // Do not wait here: a successful clipboard provider remains alive until
-    // its selection is superseded, which is the expected Wayland behavior.
-    drop(child.stdin.take());
-    thread::spawn(move || match child.wait_with_output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => eprintln!(
-            "clipboard provider exited unsuccessfully: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => eprintln!("clipboard provider wait failed: {error}"),
-    });
+    drop(stdin);
+    *provider = Some(child);
     Ok(())
+}
+
+fn stop_provider(provider: &mut Option<std::process::Child>) {
+    let Some(mut child) = provider.take() else {
+        return;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            // Replacing a local selection is an expected shutdown path, so a
+            // best-effort kill plus reap prevents stale providers and zombies
+            // without delaying the synchronization loop on normal operation.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(error) => eprintln!("clipboard provider status check failed: {error}"),
+    }
 }
 
 fn validate_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
