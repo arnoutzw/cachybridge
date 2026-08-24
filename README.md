@@ -69,9 +69,8 @@ cachybridge pair-host --connect 192.168.2.24:45232 \
 The configuration directory is mode 0700 and its `config.v4` file is mode
 0600. `seamless-host-config` and `seamless-client-config` load peer endpoints,
 the PSK, placement, and restore tokens from that file, keeping secrets out of
-process arguments and logs. At present the live seamless runtime supports a
-peer on the **left**; the GUI retains all four placements for the planned
-generalized topology runtime.
+process arguments and logs. The live seamless runtime supports a peer on the
+**left or right**; vertical placement remains planned work.
 
 The real local kernel adapters can be verified without visible input using:
 

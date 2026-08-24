@@ -317,6 +317,34 @@ mod tests {
     }
 
     #[test]
+    fn application_transport_accepts_a_maximum_clipboard_record() {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to bind loopback TCP listener: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let expected = vec![b'x'; MAX_APPLICATION_PAYLOAD];
+        let server = thread::spawn({
+            let expected = expected.clone();
+            move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut connection =
+                    SecureConnection::connect(stream, Role::Client, &[4_u8; 32]).unwrap();
+                assert_eq!(connection.receive_payload().unwrap(), expected);
+            }
+        });
+        let mut connection = SecureConnection::connect(
+            TcpStream::connect(address).unwrap(),
+            Role::Host,
+            &[4_u8; 32],
+        )
+        .unwrap();
+        connection.send_payload(&expected).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn psk_parser_rejects_invalid_text() {
         assert!(parse_psk("ff").is_err());
         assert!(parse_psk(&"z".repeat(64)).is_err());
