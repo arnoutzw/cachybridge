@@ -44,6 +44,12 @@ QString managedAutostartPath() {
     return config.isEmpty() ? QString() : config + QStringLiteral("/autostart/cachybridge-tray.desktop");
 }
 
+QSettings setupSettings() {
+    // Setup owns pairing and restore state under this stable application ID.
+    // The tray must read the same store even though it has a different title.
+    return QSettings(QStringLiteral("CachyOS"), QStringLiteral("CachyBridge Setup"));
+}
+
 bool setLoginAutostart(bool enabled) {
     const QString path = managedAutostartPath();
     if (path.isEmpty())
@@ -98,14 +104,14 @@ public:
             [this] { restoreSavedSession(); });
         auto *startAtLogin = menu->addAction(QStringLiteral("Start and reconnect at login"));
         startAtLogin->setCheckable(true);
-        QSettings settings;
+        QSettings settings = setupSettings();
         startAtLogin->setChecked(settings.value(QStringLiteral("startup/enabled"), false).toBool());
         connect(startAtLogin, &QAction::toggled, this, [this, startAtLogin](bool enabled) {
             if (!setLoginAutostart(enabled)) {
                 startAtLogin->setChecked(false);
                 return;
             }
-            QSettings settings;
+            QSettings settings = setupSettings();
             settings.setValue(QStringLiteral("startup/enabled"), enabled);
             settings.sync();
         });
@@ -161,7 +167,7 @@ private:
     }
 
     void restoreSavedSession() {
-        QSettings settings;
+        QSettings settings = setupSettings();
         const QString peerId = settings.value(QStringLiteral("startup/peer-id")).toString();
         const QString role = settings.value(QStringLiteral("startup/role")).toString();
         if (peerId.size() != 32 || (role != QStringLiteral("host") && role != QStringLiteral("client"))) {
