@@ -23,6 +23,7 @@
 #include <QScreen>
 #include <QSpinBox>
 #include <QSysInfo>
+#include <QStandardPaths>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
 #include <QVBoxLayout>
@@ -64,6 +65,43 @@ struct PairJoinDraft {
     Placement placement = Placement::Left;
     bool persistentPermissions = false;
 };
+
+QString detectedLanCidr() {
+    QProcess process;
+    process.start(QStringLiteral("ip"), {
+        QStringLiteral("-o"), QStringLiteral("-4"), QStringLiteral("addr"),
+        QStringLiteral("show"), QStringLiteral("scope"), QStringLiteral("global")
+    });
+    if (!process.waitForStarted() || !process.waitForFinished(1000)
+        || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0)
+        return {};
+    for (const QString &line : QString::fromUtf8(process.readAllStandardOutput())
+             .split(u'\n', Qt::SkipEmptyParts)) {
+        const QStringList fields = line.simplified().split(u' ', Qt::SkipEmptyParts);
+        const int inet = fields.indexOf(QStringLiteral("inet"));
+        if (inet < 0 || inet + 1 >= fields.size()) continue;
+        const QStringList address = fields.at(inet + 1).split(u'/');
+        bool prefixOk = false;
+        const int prefix = address.value(1).toInt(&prefixOk);
+        const QStringList octets = address.value(0).split(u'.');
+        if (!prefixOk || prefix < 8 || prefix > 30 || octets.size() != 4) continue;
+        quint32 raw = 0;
+        bool valid = true;
+        for (const QString &octet : octets) {
+            bool ok = false;
+            const auto value = octet.toUInt(&ok);
+            if (!ok || value > 255) { valid = false; break; }
+            raw = (raw << 8) | value;
+        }
+        if (!valid) continue;
+        const quint32 mask = 0xffffffffu << (32 - prefix);
+        const quint32 network = raw & mask;
+        return QStringLiteral("%1.%2.%3.%4/%5")
+            .arg((network >> 24) & 255).arg((network >> 16) & 255)
+            .arg((network >> 8) & 255).arg(network & 255).arg(prefix);
+    }
+    return {};
+}
 
 class DraggableClientTile final : public QGraphicsRectItem {
 public:
@@ -221,6 +259,7 @@ public:
                                     QProcess *process) = 0;
     virtual QString connectPairHost(const PairJoinDraft &draft) = 0;
     virtual QStringList discoverPairClients(QString *error) = 0;
+    virtual QString ensureClientFirewall() = 0;
     virtual QString save(const SetupDraft &draft) = 0;
 };
 
@@ -331,6 +370,39 @@ public:
         }
         return QString::fromUtf8(process.readAllStandardOutput())
             .split(u'\n', Qt::SkipEmptyParts);
+    }
+
+    QString ensureClientFirewall() override {
+        const QString ufw = QStandardPaths::findExecutable(QStringLiteral("ufw"));
+        if (ufw.isEmpty()) return {};
+        QProcess status;
+        status.start(ufw, {QStringLiteral("status")});
+        if (!status.waitForStarted() || !status.waitForFinished(5000)
+            || status.exitStatus() != QProcess::NormalExit || status.exitCode() != 0)
+            return QStringLiteral("Could not determine the local firewall state.");
+        if (!QString::fromUtf8(status.readAllStandardOutput()).contains(QStringLiteral("Status: active")))
+            return {};
+        const QString subnet = detectedLanCidr();
+        if (subnet.isEmpty())
+            return QStringLiteral("Could not determine this iMac's local IPv4 subnet for the firewall rule.");
+        QProcess rule;
+        rule.start(QStringLiteral("pkexec"), {
+            ufw, QStringLiteral("allow"), QStringLiteral("from"), subnet,
+            QStringLiteral("to"), QStringLiteral("any"), QStringLiteral("port"),
+            QStringLiteral("45231:45232"), QStringLiteral("proto"), QStringLiteral("tcp"),
+        });
+        if (!rule.waitForStarted())
+            return QStringLiteral("Could not request administrator authorization for the firewall rule.");
+        if (!rule.waitForFinished(60000)) {
+            rule.kill();
+            return QStringLiteral("Firewall authorization timed out.");
+        }
+        if (rule.exitStatus() != QProcess::NormalExit || rule.exitCode() != 0) {
+            const QString details = QString::fromUtf8(rule.readAllStandardError()).trimmed();
+            return details.isEmpty()
+                ? QStringLiteral("Firewall access was not granted; pairing was not started.") : details;
+        }
+        return {};
     }
 
     QString save(const SetupDraft &draft) override {
@@ -450,6 +522,11 @@ public:
             if (hostPairingProcess_) {
                 QMessageBox::information(this, QStringLiteral("Pairing is already open"),
                     QStringLiteral("This iMac is already waiting for one device to join."));
+                return;
+            }
+            const QString firewallError = store_->ensureClientFirewall();
+            if (!firewallError.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("LAN access is required"), firewallError);
                 return;
             }
             QString error;
