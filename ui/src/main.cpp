@@ -31,6 +31,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
+#include <QSet>
 #include <QSettings>
 #include <QSpinBox>
 #include <QSysInfo>
@@ -399,6 +400,61 @@ std::optional<MachineRole> configuredRole(const QString &cachybridge) {
     // the explicit role for all future launches.
     return line.section(u'\t', 2, 2) == QStringLiteral("right")
         ? MachineRole::Client : MachineRole::Host;
+}
+
+QString endpointAddress(const QString &endpoint) {
+    const QString trimmed = endpoint.trimmed();
+    if (trimmed.startsWith(u'[')) {
+        const int closingBracket = trimmed.indexOf(u']');
+        if (closingBracket > 1)
+            return trimmed.sliced(1, closingBracket - 1);
+    }
+    const int portSeparator = trimmed.lastIndexOf(u':');
+    return portSeparator > 0 ? trimmed.left(portSeparator) : QString();
+}
+
+// A discovered client advertises its short-lived pairing port (45232), while
+// a live session uses the encrypted KVM and clipboard ports (45231/45234).
+// Compare addresses, rather than full endpoints, so the nearby list can show
+// the actual live connection state without exposing any pairing secret.
+QSet<QString> connectedCachyBridgeAddresses() {
+    const QString ss = QStandardPaths::findExecutable(QStringLiteral("ss"));
+    if (ss.isEmpty())
+        return {};
+
+    QProcess process;
+    process.start(ss, {QStringLiteral("-H"), QStringLiteral("-tn")});
+    if (!process.waitForStarted() || !process.waitForFinished(1500)
+        || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        return {};
+    }
+
+    QSet<QString> addresses;
+    const QStringList lines = QString::fromUtf8(process.readAllStandardOutput())
+        .split(u'\n', Qt::SkipEmptyParts);
+    for (const QString &line : lines) {
+        const QStringList fields = line.simplified().split(u' ', Qt::SkipEmptyParts);
+        for (const QString &field : fields) {
+            const int separator = field.lastIndexOf(u':');
+            if (separator <= 0)
+                continue;
+            bool portIsValid = false;
+            const quint16 port = field.sliced(separator + 1).toUShort(&portIsValid);
+            if (!portIsValid || (port != 45231 && port != 45234))
+                continue;
+            const QString address = endpointAddress(field);
+            QHostAddress parsedAddress;
+            if (parsedAddress.setAddress(address))
+                addresses.insert(parsedAddress.toString());
+        }
+    }
+    return addresses;
+}
+
+bool isAddressConnected(const QString &endpoint, const QSet<QString> &connectedAddresses) {
+    QHostAddress address;
+    return address.setAddress(endpointAddress(endpoint))
+        && connectedAddresses.contains(address.toString());
 }
 
 class SetupStore {
@@ -1001,6 +1057,7 @@ public:
         const auto refreshNearbyClients = [this, nearbyClients, joinButton] {
             QString error;
             const QStringList clients = store_->discoverPairClients(&error);
+            const QSet<QString> connectedAddresses = connectedCachyBridgeAddresses();
             nearbyClients->clear();
             joinButton->setEnabled(false);
             if (!error.isEmpty()) {
@@ -1018,9 +1075,16 @@ public:
                     continue;
                 const QString endpoint = client.left(separator);
                 const QString name = client.sliced(separator + 1);
+                const bool connected = isAddressConnected(endpoint, connectedAddresses);
                 auto *item = new QListWidgetItem(
-                    QStringLiteral("%1  —  %2").arg(name, endpoint), nearbyClients);
+                    QStringLiteral("%1  —  %2%3").arg(name, endpoint,
+                        connected ? QStringLiteral("  ✓ Connected") : QString()), nearbyClients);
                 item->setData(Qt::UserRole, endpoint);
+                if (connected) {
+                    item->setData(Qt::UserRole + 1, true);
+                    item->setToolTip(QStringLiteral(
+                        "A live CachyBridge KVM or clipboard connection is active."));
+                }
             }
             pairingStatus_->setText(QStringLiteral(
                 "Select a client. It will immediately show its five-character pairing code."));
