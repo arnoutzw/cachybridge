@@ -487,6 +487,16 @@ public:
         const QString subnet = detectedLanCidr();
         if (subnet.isEmpty())
             return QStringLiteral("Could not determine this iMac's local IPv4 subnet for the firewall rule.");
+        // UFW rules persist. Avoid unnecessarily invoking pkexec after this
+        // client has already been authorized once.
+        QProcess status;
+        status.start(ufw, {QStringLiteral("status")});
+        if (status.waitForStarted() && status.waitForFinished(3000)
+            && status.exitStatus() == QProcess::NormalExit && status.exitCode() == 0
+            && QString::fromUtf8(status.readAllStandardOutput()).contains(
+                QStringLiteral("45231:45232"))) {
+            return {};
+        }
         QProcess rule;
         rule.start(QStringLiteral("pkexec"), {
             ufw, QStringLiteral("allow"), QStringLiteral("from"), subnet,
@@ -502,7 +512,7 @@ public:
         if (rule.exitStatus() != QProcess::NormalExit || rule.exitCode() != 0) {
             const QString details = QString::fromUtf8(rule.readAllStandardError()).trimmed();
             return details.isEmpty()
-                ? QStringLiteral("Firewall access was not granted; pairing was not started.") : details;
+                ? QStringLiteral("Firewall access was not granted.") : details;
         }
         return {};
     }
@@ -645,11 +655,6 @@ public:
                 QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"),
                     QStringLiteral("cachybridge-seamless-client")});
             }
-            const QString firewallError = store_->ensureClientFirewall();
-            if (!firewallError.isEmpty()) {
-                QMessageBox::warning(this, QStringLiteral("LAN access is required"), firewallError);
-                return;
-            }
             QString error;
             const QString code = store_->generatePairingCode(&error);
             if (!error.isEmpty()) {
@@ -695,6 +700,18 @@ public:
                             details.isEmpty() ? QStringLiteral("The code expired or pairing was not completed.") : details);
                     }
                 });
+        });
+        auto *firewallButton = new QPushButton(QStringLiteral("Allow CachyBridge on this LAN…"));
+        firewallButton->setToolTip(QStringLiteral(
+            "Optional one-time administrator action. It saves a persistent UFW rule for CachyBridge's LAN ports."));
+        connect(firewallButton, &QPushButton::clicked, this, [this] {
+            const QString error = store_->ensureClientFirewall();
+            if (!error.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Could not update firewall"), error);
+                return;
+            }
+            QMessageBox::information(this, QStringLiteral("LAN firewall ready"),
+                QStringLiteral("CachyBridge is allowed on this LAN. This rule is persistent; you will not be asked again."));
         });
         auto *joinButton = new QPushButton(QStringLiteral("Connect host to client with code"));
         connect(joinButton, &QPushButton::clicked, this, [this] {
@@ -755,6 +772,7 @@ public:
             if (separator <= 0) return;
             pairingAddress_->setText(selected.left(separator));
         });
+        easyLayout->addWidget(firewallButton);
         easyLayout->addWidget(hostButton);
         hostConnectPanel_ = new QWidget;
         auto *hostConnectLayout = new QVBoxLayout(hostConnectPanel_);
@@ -864,6 +882,7 @@ public:
         layout->addWidget(tabs, 1);
 
         hostButton->setVisible(role_ == MachineRole::Client);
+        firewallButton->setVisible(role_ == MachineRole::Client);
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
         tabs->setTabEnabled(2, role_ == MachineRole::Host);
     }
