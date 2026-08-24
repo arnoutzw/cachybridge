@@ -1183,24 +1183,6 @@ public:
                 showClipboard();
         });
 
-        auto *connectionDiagnostics = new QWidget;
-        auto *diagnosticsLayout = new QVBoxLayout(connectionDiagnostics);
-        diagnosticsLayout->setContentsMargins(12, 12, 12, 12);
-        auto *diagnosticsHeading = new QLabel(QStringLiteral("Live connection diagnostics"));
-        QFont diagnosticsFont = diagnosticsHeading->font();
-        diagnosticsFont.setBold(true);
-        diagnosticsHeading->setFont(diagnosticsFont);
-        auto *diagnosticsHint = new QLabel(QStringLiteral(
-            "Each channel is checked every second. A green state means this iMac has an established, "
-            "authenticated CachyBridge transport socket; it is more useful than only knowing that the service started."));
-        diagnosticsHint->setWordWrap(true);
-        diagnosticsLayout->addWidget(diagnosticsHeading);
-        diagnosticsLayout->addWidget(diagnosticsHint);
-        diagnosticsLayout->addSpacing(8);
-        diagnosticsLayout->addWidget(new QLabel(QStringLiteral(
-            "The current KVM and clipboard channel state is always visible in the status bar below.")));
-        diagnosticsLayout->addStretch();
-        tabs->addTab(connectionDiagnostics, QStringLiteral("Connections"));
         layout->addWidget(tabs, 1);
 
         auto *statusBar = new QWidget;
