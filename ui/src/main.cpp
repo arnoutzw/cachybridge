@@ -328,6 +328,7 @@ public:
         headingFont.setPointSize(headingFont.pointSize() + 4);
         headingFont.setBold(true);
         heading->setFont(headingFont);
+
         auto *host = new QPushButton(QStringLiteral("Host / master\nOwns the physical mouse and keyboard"));
         auto *client = new QPushButton(QStringLiteral("Client / slave\nReceives shared input from the host"));
         for (auto *button : {host, client}) {
@@ -728,6 +729,18 @@ public:
         headingFont.setBold(true);
         heading->setFont(headingFont);
 
+        auto *roleBanner = new QLabel(role_ == MachineRole::Host
+            ? QStringLiteral("THIS IMAC: HOST / MASTER  —  owns the physical mouse and keyboard")
+            : QStringLiteral("THIS IMAC: CLIENT / SLAVE  —  receives shared mouse and keyboard input"));
+        QFont roleFont = roleBanner->font();
+        roleFont.setPointSize(roleFont.pointSize() + 2);
+        roleFont.setBold(true);
+        roleBanner->setFont(roleFont);
+        roleBanner->setWordWrap(true);
+        roleBanner->setStyleSheet(QStringLiteral(
+            "QLabel { padding: 12px; border: 2px solid palette(highlight); "
+            "border-radius: 8px; background: palette(alternate-base); }"));
+
         auto *intro = new QLabel(role_ == MachineRole::Host
             ? QStringLiteral("Host / master mode: find a client, connect with its code, and place its display. "
                 "No input portal is opened by this setup window.")
@@ -1104,6 +1117,7 @@ public:
 
         auto *layout = new QVBoxLayout(this);
         layout->addWidget(heading);
+        layout->addWidget(roleBanner);
         layout->addWidget(intro);
         layout->addSpacing(8);
         auto *tabs = new QTabWidget;
