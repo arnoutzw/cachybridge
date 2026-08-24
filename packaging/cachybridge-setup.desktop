@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=CachyBridge Setup
-Comment=Pair and arrange CachyBridge desktops
-Exec=/home/arnoutzwartbol/.local/share/cachybridge/cachybridge setup
+Name=CachyBridge
+Comment=Share one mouse and keyboard between CachyOS desktops
+Exec=/home/arnoutzwartbol/.local/share/cachybridge/cachybridge-tray
 Terminal=false
-Categories=Settings;Qt;
+Categories=Utility;Settings;Qt;
 Keywords=mouse;keyboard;sharing;pairing;KDE;Wayland;
 StartupNotify=true

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=CachyBridge Tray
+Comment=Keep CachyBridge controls available in the system tray
+Exec=/home/arnoutzwartbol/.local/share/cachybridge/cachybridge-tray
+Icon=input-mouse
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-after=panel

@@ -1087,15 +1087,20 @@ fn configured_peer(
     Ok((path, bridge_config, peer))
 }
 
-fn require_left_peer(peer: &config::PeerConfig) -> Result<(), io::Error> {
-    if peer.placement == config::RelativePlacement::Left {
+fn require_peer_placement(
+    peer: &config::PeerConfig,
+    expected: config::RelativePlacement,
+    runtime_role: &str,
+) -> Result<(), io::Error> {
+    if peer.placement == expected {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "configured placement {} is not yet supported by seamless runtime; use left",
-                peer.placement.as_str()
+                "configured placement {} is incompatible with the {runtime_role} runtime; use {}",
+                peer.placement.as_str(),
+                expected.as_str(),
             ),
         ))
     }
@@ -1137,7 +1142,13 @@ fn run_seamless_client_config(
         );
     }
     let (path, mut bridge_config, peer) = configured_peer(config_override, peer_id)?;
-    require_left_peer(&peer)?;
+    // A client sees the host to its right and therefore owns the right-edge
+    // return barrier. Pairing stores this complementary placement on purpose.
+    require_peer_placement(
+        &peer,
+        config::RelativePlacement::Right,
+        "client (right-edge return)",
+    )?;
 
     eprintln!("starting configured RemoteDesktop and right InputCapture sessions; portal consent may be required");
     let mut injector = seamless::RemoteDesktopInjector::start_with_persistence(
@@ -1255,7 +1266,12 @@ fn run_seamless_host_config(
     peer_y: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (path, mut bridge_config, peer) = configured_peer(config_override, peer_id)?;
-    require_left_peer(&peer)?;
+    // The host owns the left-edge entry barrier for this release.
+    require_peer_placement(
+        &peer,
+        config::RelativePlacement::Left,
+        "host (left-edge entry)",
+    )?;
     let peer_x = -i32::try_from(peer_width)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "peer width exceeds i32"))?;
     let local = handoff::Rect::new(0, 0, local_width, local_height).map_err(|error| {
