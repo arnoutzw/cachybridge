@@ -467,6 +467,7 @@ public:
     virtual QString connectPairHost(const PairJoinDraft &draft, QString *peerId) = 0;
     virtual QStringList discoverPairClients(QString *error) = 0;
     virtual QStringList configuredPeers(QString *error) = 0;
+    virtual QString removePeer(const QString &peerId) = 0;
     virtual QString applyTopology(const QString &peerId, Placement placement) = 0;
     virtual QString ensureClientFirewall() = 0;
     virtual QString save(const SetupDraft &draft) = 0;
@@ -615,6 +616,19 @@ public:
         }
         return QString::fromUtf8(process.readAllStandardOutput())
             .split(u'\n', Qt::SkipEmptyParts);
+    }
+
+    QString removePeer(const QString &peerId) override {
+        QProcess process;
+        QStringList arguments{QStringLiteral("peer-remove"), QStringLiteral("--peer"), peerId};
+        if (!configPath_.isEmpty()) arguments << QStringLiteral("--config") << configPath_;
+        process.start(cachybridge_, arguments);
+        if (!process.waitForStarted() || !process.waitForFinished(5000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const QString details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            return details.isEmpty() ? QStringLiteral("Could not remove the saved pairing.") : details;
+        }
+        return {};
     }
 
     QString applyTopology(const QString &peerId, Placement placement) override {
@@ -1123,6 +1137,44 @@ public:
         if (role_ == MachineRole::Host)
             QTimer::singleShot(0, this, refreshNearbyClients);
 
+        auto *unpairButton = new QPushButton(QStringLiteral("Unpair this iMac"));
+        unpairButton->setToolTip(QStringLiteral(
+            "Stops sharing and removes the trusted pairing and local portal permissions from this iMac."));
+        connect(unpairButton, &QPushButton::clicked, this, [this, unpairButton] {
+            QString selectionError;
+            const QString peerId = configuredPeerIdForUnpair(&selectionError);
+            if (peerId.isEmpty()) {
+                QMessageBox::information(this, QStringLiteral("No pairing to remove"),
+                    selectionError.isEmpty()
+                        ? QStringLiteral("This iMac has no saved CachyBridge pairing.")
+                        : selectionError);
+                return;
+            }
+            const auto answer = QMessageBox::warning(this, QStringLiteral("Unpair this iMac?"),
+                QStringLiteral("This immediately stops sharing and removes this iMac's saved trust key "
+                    "and portal permissions. To revoke the pairing on both iMacs, use Unpair on the "
+                    "other iMac too."),
+                QMessageBox::Cancel | QMessageBox::Yes, QMessageBox::Cancel);
+            if (answer != QMessageBox::Yes)
+                return;
+
+            unpairButton->setEnabled(false);
+            const QString error = store_->removePeer(peerId);
+            if (!error.isEmpty()) {
+                unpairButton->setEnabled(true);
+                QMessageBox::warning(this, QStringLiteral("Could not unpair"), error);
+                return;
+            }
+            stopSharing();
+            clearStartupSession();
+            activePeerId_.clear();
+            pairingStatus_->setText(QStringLiteral(
+                "This iMac is unpaired. Use Unpair on the other iMac to remove its saved key too."));
+            QMessageBox::information(this, QStringLiteral("This iMac is unpaired"),
+                QStringLiteral("Sharing has stopped and the local CachyBridge pairing was removed."));
+        });
+        easyLayout->addWidget(unpairButton);
+
         auto *placementBox = new QWidget;
         auto *placementLayout = new QVBoxLayout(placementBox);
         placementLayout->setContentsMargins(12, 12, 12, 12);
@@ -1408,6 +1460,56 @@ private:
             QStringLiteral("--peer-width"), QString::number(size.width()),
             QStringLiteral("--peer-y"), QStringLiteral("0"),
         }, true);
+    }
+
+    QString configuredPeerIdForUnpair(QString *error) {
+        QString storedPeerId;
+        {
+            QSettings settings;
+            storedPeerId = settings.value(QStringLiteral("startup/peer-id")).toString();
+        }
+        if (!activePeerId_.isEmpty())
+            storedPeerId = activePeerId_;
+
+        const QStringList peers = store_->configuredPeers(error);
+        if (!error->isEmpty() || peers.isEmpty())
+            return {};
+        for (const QString &peer : peers) {
+            if (peer.section(u'\t', 0, 0).compare(storedPeerId, Qt::CaseInsensitive) == 0)
+                return storedPeerId;
+        }
+        if (peers.size() == 1)
+            return peers.first().section(u'\t', 0, 0);
+
+        QStringList labels;
+        for (const QString &peer : peers) {
+            labels << QStringLiteral("%1 — %2")
+                .arg(peer.section(u'\t', 1, 1), peer.section(u'\t', 4, 4));
+        }
+        bool accepted = false;
+        const QString selected = QInputDialog::getItem(this, QStringLiteral("Choose pairing to unpair"),
+            QStringLiteral("Paired iMac"), labels, 0, false, &accepted);
+        if (!accepted)
+            return {};
+        return peers.value(labels.indexOf(selected)).section(u'\t', 0, 0);
+    }
+
+    void stopSharing() const {
+        const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
+        if (!systemctl.isEmpty()) {
+            QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"),
+                QStringLiteral("cachybridge-seamless-host"),
+                QStringLiteral("cachybridge-seamless-client")});
+        }
+    }
+
+    void clearStartupSession() const {
+        QSettings settings;
+        settings.remove(QStringLiteral("startup/peer-id"));
+        settings.remove(QStringLiteral("startup/role"));
+        settings.remove(QStringLiteral("startup/peer-width"));
+        settings.remove(QStringLiteral("startup/peer-height"));
+        settings.sync();
     }
 
     QString startHostSession(const QString &peerId) const {

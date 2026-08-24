@@ -247,6 +247,18 @@ impl BridgeConfig {
             .ok_or_else(|| ConfigError::PeerNotFound(id.to_owned()))
     }
 
+    /// Removes the trusted peer and its locally stored portal restore tokens.
+    /// The returned record is intended only for identifying the removed peer in
+    /// local UI/CLI output; callers must never render its secret fields.
+    pub fn remove_peer(&mut self, id: &str) -> Result<PeerConfig, ConfigError> {
+        let index = self
+            .peers
+            .iter()
+            .position(|peer| peer.id.eq_ignore_ascii_case(id))
+            .ok_or_else(|| ConfigError::PeerNotFound(id.to_owned()))?;
+        Ok(self.peers.remove(index))
+    }
+
     /// Changes the stored position for an existing trusted peer.  Callers
     /// persist the complete config with [`save`] so a topology change is one
     /// private, atomic rewrite rather than a partially edited file.
@@ -749,6 +761,22 @@ mod tests {
         assert!(!debug.contains("7, 7"));
         assert!(!debug.contains("capture token value"));
         assert!(!debug.contains("remote token value"));
+    }
+
+    #[test]
+    fn remove_peer_forgets_the_requested_trust_record() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut config = BridgeConfig {
+            peers: vec![peer()],
+            ..BridgeConfig::default()
+        };
+        let removed = config.remove_peer(id).unwrap();
+        assert_eq!(removed.id, id);
+        assert!(config.peers.is_empty());
+        assert_eq!(
+            config.peer(id),
+            Err(ConfigError::PeerNotFound(id.to_owned()))
+        );
     }
 
     #[test]

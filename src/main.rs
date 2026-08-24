@@ -212,6 +212,15 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Forget one trusted peer and its locally stored portal permissions.
+    PeerRemove {
+        /// Configured 32-character peer ID (shown by `peer-list`).
+        #[arg(long)]
+        peer: String,
+        /// Use this configuration file instead of the normal per-user path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Persist a new horizontal peer position on both paired machines, then
     /// make the controlled side restart its portal session.
     TopologyApply {
@@ -641,6 +650,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     peer.client_endpoint
                 );
             }
+            Ok(())
+        }
+        Command::PeerRemove {
+            peer,
+            config: config_override,
+        } => {
+            let path = resolve_config_path(config_override)?;
+            let mut bridge_config = config::load_or_default(&path)?;
+            let removed = bridge_config.remove_peer(&peer)?;
+            config::save(&path, &bridge_config)?;
+            println!("removed_peer_id={}", removed.id);
             Ok(())
         }
         Command::TopologyApply {
@@ -1961,6 +1981,17 @@ mod tests {
             ]),
             Ok(Cli {
                 command: Command::PeerAdd { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "cachybridge",
+                "peer-remove",
+                "--peer",
+                "0123456789abcdef0123456789abcdef",
+            ]),
+            Ok(Cli {
+                command: Command::PeerRemove { .. }
             })
         ));
         assert!(matches!(

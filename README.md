@@ -27,6 +27,10 @@ The Qt 6 Widgets wizard offers a host-led **Easy one-time pairing** flow:
    machines save the new peer automatically; the code expires after five
    minutes and works for one successful join only.
 
+Either role can choose **Unpair this iMac** in setup. It stops local sharing
+and removes the local trust key and portal permissions. Run the same action on
+the other iMac to revoke its saved copy too.
+
 ```bash
 cargo build --release --offline
 cmake -S ui -B build/ui -DCMAKE_BUILD_TYPE=Release
