@@ -1060,6 +1060,7 @@ public:
 
         persistent_ = new QCheckBox(
             QStringLiteral("Remember desktop portal permissions (recommended on these two iMacs)"));
+        persistent_->setChecked(true);
         persistent_->setToolTip(QStringLiteral(
             "Stores portal-issued single-use restore tokens in the private CachyBridge configuration."));
         easyLayout->addWidget(persistent_);
