@@ -509,6 +509,12 @@ public:
         tokenRow->addWidget(generateSecret);
         tokenRow->addWidget(showSecret);
         form->addRow(QStringLiteral("Pairing PSK / token"), tokenRow);
+        auto *manualPairing = new QGroupBox(QStringLiteral("Advanced manual pairing"));
+        manualPairing->setCheckable(true);
+        manualPairing->setChecked(false);
+        manualPairing->setToolTip(QStringLiteral(
+            "Use only for recovery or an explicitly managed PSK. Normal setup uses a short one-time code."));
+        manualPairing->setLayout(form);
 
         auto *easyPairing = new QGroupBox(QStringLiteral("Easy one-time pairing (recommended)"));
         auto *easyLayout = new QVBoxLayout(easyPairing);
@@ -664,7 +670,7 @@ public:
         layout->addWidget(intro);
         layout->addSpacing(8);
         layout->addWidget(easyPairing);
-        layout->addLayout(form);
+        layout->addWidget(manualPairing);
         layout->addWidget(placementBox);
         layout->addWidget(persistent_);
         layout->addLayout(actions);
