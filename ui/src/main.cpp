@@ -605,6 +605,89 @@ private:
     QString configPath_;
 };
 
+// The data plane deliberately has separate encrypted TCP channels for KVM
+// input and clipboard transfers.  Poll their socket state rather than merely
+// reporting whether a systemd unit was started: a unit can be running while it
+// is waiting for a peer, a portal approval, or a reconnect.  The one-second
+// timer doubles as a small, visible diagnostics heartbeat in the setup UI.
+class ConnectionHeartbeatMonitor final : public QObject {
+public:
+    ConnectionHeartbeatMonitor(QLabel *label, QString channel, quint16 port, QObject *parent)
+        : QObject(parent), label_(label), channel_(std::move(channel)), port_(port) {
+        label_->setWordWrap(true);
+        label_->setToolTip(QStringLiteral(
+            "CachyBridge checks for an established encrypted TCP socket once per second. "
+            "This diagnostic heartbeat distinguishes a running service from a live peer connection."));
+        timer_.setInterval(1000);
+        connect(&timer_, &QTimer::timeout, this, [this] { probe(); });
+    }
+
+    void start() {
+        timer_.start();
+        probe();
+    }
+
+private:
+    void show(const QString &state, const QString &color) const {
+        label_->setText(QStringLiteral("<span style=\"color:%1\"><b>%2</b></span> — %3")
+            .arg(color, channel_, state));
+    }
+
+    void probe() {
+        if (probe_)
+            return;
+        const QString ss = QStandardPaths::findExecutable(QStringLiteral("ss"));
+        if (ss.isEmpty()) {
+            show(QStringLiteral("diagnostics unavailable (the ss utility is missing)"),
+                 QStringLiteral("#d97706"));
+            return;
+        }
+
+        auto *process = new QProcess(this);
+        probe_ = process;
+        connect(process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [this, process](int exitCode, QProcess::ExitStatus status) {
+                const QString now = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
+                const QString output = QString::fromUtf8(process->readAllStandardOutput());
+                const QStringList lines = output.split(u'\n', Qt::SkipEmptyParts);
+                const bool connected = status == QProcess::NormalExit && exitCode == 0
+                    && std::any_of(lines.cbegin(), lines.cend(), [this](const QString &line) {
+                            return line.startsWith(QStringLiteral("ESTAB"))
+                                && line.contains(QStringLiteral(":%1").arg(port_));
+                        });
+                if (connected) {
+                    lastHealthyProbe_ = now;
+                    show(QStringLiteral("connected · diagnostic heartbeat %1").arg(now),
+                         QStringLiteral("#15803d"));
+                } else if (lastHealthyProbe_.isEmpty()) {
+                    show(QStringLiteral("waiting for a peer · checked %1").arg(now),
+                         QStringLiteral("#b45309"));
+                } else {
+                    show(QStringLiteral("disconnected · last healthy heartbeat %1 · checked %2")
+                             .arg(lastHealthyProbe_, now),
+                         QStringLiteral("#b91c1c"));
+                }
+                probe_ = nullptr;
+                process->deleteLater();
+            });
+        connect(process, &QProcess::errorOccurred, this,
+            [this, process](QProcess::ProcessError) {
+                if (process->state() == QProcess::NotRunning) {
+                    show(QStringLiteral("diagnostic check could not run"), QStringLiteral("#d97706"));
+                    probe_ = nullptr;
+                }
+            });
+        process->start(ss, {QStringLiteral("-H"), QStringLiteral("-tn")});
+    }
+
+    QLabel *label_;
+    QString channel_;
+    quint16 port_;
+    QTimer timer_;
+    QProcess *probe_ = nullptr;
+    QString lastHealthyProbe_;
+};
+
 class SetupWindow final : public QWidget {
 public:
     explicit SetupWindow(std::unique_ptr<SetupStore> store, MachineRole role)
@@ -1000,7 +1083,35 @@ public:
         tabs->addTab(easyPairing, QStringLiteral("Easy pairing"));
         tabs->addTab(manualPairing, QStringLiteral("Manual pairing"));
         tabs->addTab(placementBox, QStringLiteral("Client placement"));
+
+        auto *connectionDiagnostics = new QWidget;
+        auto *diagnosticsLayout = new QVBoxLayout(connectionDiagnostics);
+        diagnosticsLayout->setContentsMargins(12, 12, 12, 12);
+        auto *diagnosticsHeading = new QLabel(QStringLiteral("Live connection diagnostics"));
+        QFont diagnosticsFont = diagnosticsHeading->font();
+        diagnosticsFont.setBold(true);
+        diagnosticsHeading->setFont(diagnosticsFont);
+        auto *diagnosticsHint = new QLabel(QStringLiteral(
+            "Each channel is checked every second. A green state means this iMac has an established, "
+            "authenticated CachyBridge transport socket; it is more useful than only knowing that the service started."));
+        diagnosticsHint->setWordWrap(true);
+        auto *kvmStatus = new QLabel;
+        auto *clipboardStatus = new QLabel;
+        diagnosticsLayout->addWidget(diagnosticsHeading);
+        diagnosticsLayout->addWidget(diagnosticsHint);
+        diagnosticsLayout->addSpacing(8);
+        diagnosticsLayout->addWidget(kvmStatus);
+        diagnosticsLayout->addWidget(clipboardStatus);
+        diagnosticsLayout->addStretch();
+        tabs->addTab(connectionDiagnostics, QStringLiteral("Connections"));
         layout->addWidget(tabs, 1);
+
+        auto *kvmHeartbeat = new ConnectionHeartbeatMonitor(
+            kvmStatus, QStringLiteral("KVM input (TCP 45231)"), 45231, this);
+        auto *clipboardHeartbeat = new ConnectionHeartbeatMonitor(
+            clipboardStatus, QStringLiteral("Clipboard (TCP 45234)"), 45234, this);
+        kvmHeartbeat->start();
+        clipboardHeartbeat->start();
 
         hostButton->setVisible(role_ == MachineRole::Client);
         firewallButton->setVisible(role_ == MachineRole::Client);
