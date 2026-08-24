@@ -1,19 +1,26 @@
 #include <QApplication>
-#include <QButtonGroup>
 #include <QCheckBox>
 #include <QCommandLineParser>
 #include <QFile>
 #include <QFileInfo>
 #include <QFormLayout>
-#include <QGridLayout>
+#include <QGraphicsRectItem>
+#include <QGraphicsScene>
+#include <QGraphicsSceneMouseEvent>
+#include <QGraphicsSimpleTextItem>
+#include <QGraphicsView>
+#include <QGuiApplication>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QScreen>
+#include <QSpinBox>
 #include <QSysInfo>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
@@ -21,6 +28,7 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <functional>
 #include <memory>
 
 namespace {
@@ -55,6 +63,120 @@ struct PairJoinDraft {
     bool persistentPermissions = false;
 };
 
+class DraggableClientTile final : public QGraphicsRectItem {
+public:
+    explicit DraggableClientTile(const QRectF &rect, std::function<void(QPointF)> released)
+        : QGraphicsRectItem(rect), released_(std::move(released)) {
+        setFlags(ItemIsMovable | ItemSendsGeometryChanges);
+        setCursor(Qt::OpenHandCursor);
+    }
+
+protected:
+    void mousePressEvent(QGraphicsSceneMouseEvent *event) override {
+        setCursor(Qt::ClosedHandCursor);
+        QGraphicsRectItem::mousePressEvent(event);
+    }
+
+    void mouseReleaseEvent(QGraphicsSceneMouseEvent *event) override {
+        QGraphicsRectItem::mouseReleaseEvent(event);
+        setCursor(Qt::OpenHandCursor);
+        released_(pos());
+    }
+
+private:
+    std::function<void(QPointF)> released_;
+};
+
+class DisplayLayoutPreview final : public QGraphicsView {
+public:
+    DisplayLayoutPreview() : scene_(this) {
+        setScene(&scene_);
+        setMinimumHeight(260);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setFrameShape(QFrame::NoFrame);
+        const auto *screen = QGuiApplication::primaryScreen();
+        hostResolution_ = screen ? screen->size() : QSize(2560, 1440);
+        clientResolution_ = hostResolution_;
+        rebuild();
+    }
+
+    Placement placement() const { return placement_; }
+
+    QSize clientResolution() const { return clientResolution_; }
+
+    void setClientResolution(QSize resolution) {
+        clientResolution_.setWidth(std::max(resolution.width(), 640));
+        clientResolution_.setHeight(std::max(resolution.height(), 480));
+        rebuild();
+    }
+
+private:
+    void resizeEvent(QResizeEvent *event) override {
+        QGraphicsView::resizeEvent(event);
+        fitInView(scene_.sceneRect(), Qt::KeepAspectRatio);
+    }
+
+    void rebuild() {
+        scene_.clear();
+        const qreal scale = std::min(280.0 / hostResolution_.width(), 165.0 / hostResolution_.height());
+        const QSizeF host(hostResolution_.width() * scale, hostResolution_.height() * scale);
+        const QSizeF client(clientResolution_.width() * scale, clientResolution_.height() * scale);
+        const QRectF hostRect(0, 0, host.width(), host.height());
+        auto *hostTile = scene_.addRect(hostRect, QPen(palette().highlight(), 2), QBrush(palette().base()));
+        auto *hostLabel = scene_.addSimpleText(
+            QStringLiteral("Host\n%1 × %2").arg(hostResolution_.width()).arg(hostResolution_.height()));
+        hostLabel->setPos(hostRect.center() - hostLabel->boundingRect().center());
+        hostLabel->setParentItem(hostTile);
+
+        QRectF clientRect(0, 0, client.width(), client.height());
+        clientTile_ = new DraggableClientTile(clientRect, [this](QPointF point) { snapFrom(point); });
+        clientTile_->setPen(QPen(palette().highlight(), 2));
+        clientTile_->setBrush(QBrush(palette().alternateBase()));
+        scene_.addItem(clientTile_);
+        auto *clientLabel = scene_.addSimpleText(
+            QStringLiteral("Client\n%1 × %2").arg(clientResolution_.width()).arg(clientResolution_.height()));
+        clientLabel->setPos(clientRect.center() - clientLabel->boundingRect().center());
+        clientLabel->setParentItem(clientTile_);
+
+        placeClient(hostRect, clientRect);
+        hostRect_ = hostRect;
+        scene_.setSceneRect(-client.width() - 40, -client.height() - 40,
+            host.width() + client.width() * 2 + 80, host.height() + client.height() * 2 + 80);
+        fitInView(scene_.sceneRect(), Qt::KeepAspectRatio);
+    }
+
+    void placeClient(const QRectF &host, const QRectF &client) {
+        constexpr qreal gap = 14;
+        QPointF position;
+        switch (placement_) {
+        case Placement::Left: position = {host.left() - client.width() - gap, host.center().y() - client.height() / 2}; break;
+        case Placement::Right: position = {host.right() + gap, host.center().y() - client.height() / 2}; break;
+        case Placement::Above: position = {host.center().x() - client.width() / 2, host.top() - client.height() - gap}; break;
+        case Placement::Below: position = {host.center().x() - client.width() / 2, host.bottom() + gap}; break;
+        }
+        clientTile_->setPos(position);
+    }
+
+    void snapFrom(QPointF position) {
+        const QPointF hostCenter = hostRect_.center();
+        const QPointF clientCenter = position + clientTile_->rect().center();
+        const QPointF delta = clientCenter - hostCenter;
+        if (std::abs(delta.x()) >= std::abs(delta.y()))
+            placement_ = delta.x() < 0 ? Placement::Left : Placement::Right;
+        else
+            placement_ = delta.y() < 0 ? Placement::Above : Placement::Below;
+        rebuild();
+    }
+
+    QGraphicsScene scene_;
+    DraggableClientTile *clientTile_ = nullptr;
+    QSize hostResolution_;
+    QSize clientResolution_;
+    QRectF hostRect_;
+    Placement placement_ = Placement::Left;
+};
+
 class SetupStore {
 public:
     virtual ~SetupStore() = default;
@@ -63,6 +185,7 @@ public:
     virtual QString startPairClient(const SetupDraft &draft, const QString &code,
                                     QProcess *process) = 0;
     virtual QString connectPairHost(const PairJoinDraft &draft) = 0;
+    virtual QStringList discoverPairClients(QString *error) = 0;
     virtual QString save(const SetupDraft &draft) = 0;
 };
 
@@ -113,7 +236,7 @@ public:
             return {};
         }
         const QString code = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
-        if (code.size() != 31) {
+        if (code.size() != 5) {
             *error = QStringLiteral("The code generator returned an unexpected value.");
             return {};
         }
@@ -160,6 +283,19 @@ public:
             return details.isEmpty() ? QStringLiteral("Pairing was rejected or expired.") : details;
         }
         return {};
+    }
+
+    QStringList discoverPairClients(QString *error) override {
+        QProcess process;
+        process.start(cachybridge_, {QStringLiteral("pair-discover"), QStringLiteral("--timeout-seconds"), QStringLiteral("2")});
+        if (!process.waitForStarted() || !process.waitForFinished(4000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            *error = details.isEmpty() ? QStringLiteral("Client discovery failed.") : details;
+            return {};
+        }
+        return QString::fromUtf8(process.readAllStandardOutput())
+            .split(u'\n', Qt::SkipEmptyParts);
     }
 
     QString save(const SetupDraft &draft) override {
@@ -235,8 +371,8 @@ public:
         pairingPsk_->setPlaceholderText(QStringLiteral("64 hexadecimal characters"));
 
         pairingCode_ = new QLineEdit;
-        pairingCode_->setPlaceholderText(QStringLiteral("ABCDE-FGHJK-MNPQR-STUVW-XYZ23-4"));
-        pairingCode_->setMaxLength(31);
+        pairingCode_->setPlaceholderText(QStringLiteral("ABCDE"));
+        pairingCode_->setMaxLength(5);
         pairingAddress_ = new QLineEdit;
         pairingAddress_->setPlaceholderText(QStringLiteral("Client address, e.g. 192.168.2.24:45232"));
 
@@ -336,25 +472,62 @@ public:
         auto *joinForm = new QFormLayout;
         joinForm->addRow(QStringLiteral("Client address"), pairingAddress_);
         joinForm->addRow(QStringLiteral("One-time code"), pairingCode_);
+        auto *discoverButton = new QPushButton(QStringLiteral("Find nearby clients"));
+        connect(discoverButton, &QPushButton::clicked, this, [this] {
+            QString error;
+            const QStringList clients = store_->discoverPairClients(&error);
+            if (!error.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Discovery failed"), error);
+                return;
+            }
+            if (clients.isEmpty()) {
+                QMessageBox::information(this, QStringLiteral("No client found"),
+                    QStringLiteral("Open setup on the client and choose ‘Show one-time code on this client iMac’."));
+                return;
+            }
+            QString selected = clients.first();
+            if (clients.size() > 1) {
+                bool accepted = false;
+                selected = QInputDialog::getItem(this, QStringLiteral("Choose a client"),
+                    QStringLiteral("Nearby clients"), clients, 0, false, &accepted);
+                if (!accepted) return;
+            }
+            const int separator = selected.indexOf(u'\t');
+            if (separator <= 0) return;
+            pairingAddress_->setText(selected.left(separator));
+        });
         easyLayout->addWidget(hostButton);
         easyLayout->addLayout(joinForm);
+        easyLayout->addWidget(discoverButton);
         easyLayout->addWidget(joinButton);
 
         auto *placementBox = new QGroupBox(QStringLiteral("Client placement"));
-        auto *placementGrid = new QGridLayout(placementBox);
-        placementGroup_ = new QButtonGroup(this);
-        placementGroup_->setExclusive(true);
-        addPlacementButton(placementGrid, QStringLiteral("Client above\n↑"), Placement::Above, 0, 1);
-        addPlacementButton(placementGrid, QStringLiteral("Client left\n←"), Placement::Left, 1, 0, true);
-        auto *host = new QLabel(QStringLiteral("This host\n(center)"));
-        host->setAlignment(Qt::AlignCenter);
-        host->setMinimumSize(145, 72);
-        host->setStyleSheet(QStringLiteral(
-            "QLabel { border: 2px solid palette(highlight); border-radius: 8px; "
-            "background: palette(base); font-weight: 600; }"));
-        placementGrid->addWidget(host, 1, 1);
-        addPlacementButton(placementGrid, QStringLiteral("Client right\n→"), Placement::Right, 1, 2);
-        addPlacementButton(placementGrid, QStringLiteral("Client below\n↓"), Placement::Below, 2, 1);
+        auto *placementLayout = new QVBoxLayout(placementBox);
+        auto *hint = new QLabel(QStringLiteral(
+            "Drag the client tile to an edge of the host tile. Tile sizes reflect the selected display resolutions."));
+        hint->setWordWrap(true);
+        placementPreview_ = new DisplayLayoutPreview;
+        clientWidth_ = new QSpinBox;
+        clientHeight_ = new QSpinBox;
+        for (auto *spin : {clientWidth_, clientHeight_}) {
+            spin->setRange(640, 16384);
+            spin->setSingleStep(16);
+            spin->setSuffix(QStringLiteral(" px"));
+        }
+        clientWidth_->setValue(placementPreview_->clientResolution().width());
+        clientHeight_->setValue(placementPreview_->clientResolution().height());
+        connect(clientWidth_, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+            placementPreview_->setClientResolution({clientWidth_->value(), clientHeight_->value()});
+        });
+        connect(clientHeight_, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
+            placementPreview_->setClientResolution({clientWidth_->value(), clientHeight_->value()});
+        });
+        auto *resolutionForm = new QFormLayout;
+        resolutionForm->addRow(QStringLiteral("Client width"), clientWidth_);
+        resolutionForm->addRow(QStringLiteral("Client height"), clientHeight_);
+        placementLayout->addWidget(hint);
+        placementLayout->addWidget(placementPreview_);
+        placementLayout->addLayout(resolutionForm);
 
         persistent_ = new QCheckBox(
             QStringLiteral("Remember desktop portal permissions (recommended on these two iMacs)"));
@@ -384,39 +557,29 @@ public:
 
 private:
     Placement selectedPlacement() const {
-        const auto *button = placementGroup_->checkedButton();
-        if (!button) return Placement::Left;
-        const auto placement = button->property("placement").toString();
-        if (placement == QStringLiteral("right")) return Placement::Right;
-        if (placement == QStringLiteral("above")) return Placement::Above;
-        if (placement == QStringLiteral("below")) return Placement::Below;
-        return Placement::Left;
+        return placementPreview_->placement();
     }
 
     static QString localLanAddress() {
         QProcess process;
-        process.start(QStringLiteral("hostname"), {QStringLiteral("-I")});
+        process.start(QStringLiteral("ip"), {
+            QStringLiteral("-o"), QStringLiteral("-4"), QStringLiteral("addr"),
+            QStringLiteral("show"), QStringLiteral("scope"), QStringLiteral("global")
+        });
         if (process.waitForStarted() && process.waitForFinished(1000)
             && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0) {
-            const QStringList addresses = QString::fromUtf8(process.readAllStandardOutput())
-                .simplified().split(u' ', Qt::SkipEmptyParts);
-            for (const QString &address : addresses) {
-                if (!address.startsWith(QStringLiteral("127.")))
-                    return address;
+            const QStringList lines = QString::fromUtf8(process.readAllStandardOutput())
+                .split(u'\n', Qt::SkipEmptyParts);
+            for (const QString &line : lines) {
+                const QStringList fields = line.simplified().split(u' ', Qt::SkipEmptyParts);
+                const int inet = fields.indexOf(QStringLiteral("inet"));
+                if (inet >= 0 && inet + 1 < fields.size()) {
+                    const QString address = fields.at(inet + 1).section(u'/', 0, 0);
+                    if (!address.startsWith(QStringLiteral("127."))) return address;
+                }
             }
         }
         return QStringLiteral("<this iMac's LAN IP>");
-    }
-
-    void addPlacementButton(QGridLayout *layout, const QString &label, Placement placement,
-                            int row, int column, bool checked = false) {
-        auto *button = new QPushButton(label);
-        button->setCheckable(true);
-        button->setMinimumSize(145, 72);
-        button->setProperty("placement", placementName(placement));
-        button->setChecked(checked);
-        placementGroup_->addButton(button, static_cast<int>(placement));
-        layout->addWidget(button, row, column);
     }
 
     void save() {
@@ -448,19 +611,10 @@ private:
                 QStringLiteral("The pairing token must contain exactly 64 hexadecimal characters."));
             return;
         }
-        const auto *button = placementGroup_->checkedButton();
-        if (!button)
-            return;
-        const auto placementText = button->property("placement").toString();
-        Placement placement = Placement::Left;
-        if (placementText == QStringLiteral("right")) placement = Placement::Right;
-        else if (placementText == QStringLiteral("above")) placement = Placement::Above;
-        else if (placementText == QStringLiteral("below")) placement = Placement::Below;
-
         SetupDraft draft{
             hostName_->text().trimmed(), hostEndpoint_->text().trimmed(),
             clientName_->text().trimmed(), clientEndpoint_->text().trimmed(),
-            token, placement, persistent_->isChecked()
+            token, selectedPlacement(), persistent_->isChecked()
         };
         const QString error = store_->save(draft);
         if (!error.isEmpty()) {
@@ -480,7 +634,9 @@ private:
     QLineEdit *pairingPsk_ = nullptr;
     QLineEdit *pairingCode_ = nullptr;
     QLineEdit *pairingAddress_ = nullptr;
-    QButtonGroup *placementGroup_ = nullptr;
+    DisplayLayoutPreview *placementPreview_ = nullptr;
+    QSpinBox *clientWidth_ = nullptr;
+    QSpinBox *clientHeight_ = nullptr;
     QCheckBox *persistent_ = nullptr;
     QProcess *hostPairingProcess_ = nullptr;
 };

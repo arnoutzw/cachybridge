@@ -5,6 +5,7 @@
 //! discovery, clipboard, or edge-handoff logic yet.
 
 pub mod config;
+mod discovery;
 pub mod handoff;
 mod handoff_demo;
 pub mod libei_capture;
@@ -90,8 +91,7 @@ enum Command {
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// Print a short, 128-bit one-time pairing code. It can be entered with or
-    /// without dashes, and is consumed by `pair-client` / `pair-host`.
+    /// Print a five-character one-time pairing code, authenticated with SPAKE2.
     PairCode,
     /// Run on the controlled client: wait for one input-owner host to connect
     /// using a one-time code, then save a fresh long-term peer key locally.
@@ -117,6 +117,12 @@ enum Command {
         persistent_permissions: bool,
         /// Maximum time to wait for the joining machine.
         #[arg(long, default_value_t = 300)]
+        timeout_seconds: u64,
+    },
+    /// Find controlled clients that are currently waiting for a pairing host.
+    PairDiscover {
+        /// How long to listen for local multicast announcements.
+        #[arg(long, default_value_t = 2)]
         timeout_seconds: u64,
     },
     /// Run on the input-owner host: connect to a client displaying a one-time
@@ -506,6 +512,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             persistent_permissions,
             Duration::from_secs(timeout_seconds),
         ),
+        Command::PairDiscover { timeout_seconds } => {
+            for client in discovery::discover(Duration::from_secs(timeout_seconds))? {
+                println!("{}\t{}", client.endpoint, client.name);
+            }
+            Ok(())
+        }
         Command::PairHost {
             connect,
             code,
@@ -763,7 +775,7 @@ fn run_pair_client(
         )
         .into());
     }
-    let temporary_psk = pairing::temporary_psk(code)?;
+    let pairing_code = pairing::normalize_code(code)?;
     let config_path = resolve_config_path(config_override)?;
     let mut bridge_config = config::load_or_default(&config_path)?;
     if let Some(name) = local_name {
@@ -772,6 +784,10 @@ fn run_pair_client(
     }
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
+    let _advertiser = discovery::Advertiser::start(
+        listener.local_addr()?.port(),
+        bridge_config.local_name.clone(),
+    )?;
     eprintln!(
         "pairing client ready on {}; waiting up to {} seconds for one code-authenticated host",
         listener.local_addr()?,
@@ -791,8 +807,11 @@ fn run_pair_client(
                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(10)))?;
                 let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                    let mut connection =
-                        SecureConnection::connect(stream, Role::Client, &temporary_psk)?;
+                    let mut connection = SecureConnection::connect_with_pairing_code(
+                        stream,
+                        Role::Client,
+                        pairing_code.as_bytes(),
+                    )?;
                     let request = pairing::decode_request(&connection.receive_payload()?)?;
                     let host_endpoint =
                         pairing::checked_endpoint(remote.ip(), request.host_service_port)?;
@@ -867,13 +886,14 @@ fn run_pair_host(
             io::Error::new(io::ErrorKind::InvalidInput, "service port must be non-zero").into(),
         );
     }
-    let temporary_psk = pairing::temporary_psk(code)?;
+    let pairing_code = pairing::normalize_code(code)?;
     let stream = TcpStream::connect_timeout(&connect, Duration::from_secs(10))?;
     let client_ip = stream.peer_addr()?.ip();
     let host_ip = stream.local_addr()?.ip();
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut connection = SecureConnection::connect(stream, Role::Host, &temporary_psk)?;
+    let mut connection =
+        SecureConnection::connect_with_pairing_code(stream, Role::Host, pairing_code.as_bytes())?;
     let request = pairing::PairRequest {
         host_name: local_name.clone(),
         host_service_port: service_port,

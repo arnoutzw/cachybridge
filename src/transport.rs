@@ -4,12 +4,14 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 use snow::{params::NoiseParams, Builder, TransportState};
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use thiserror::Error;
 
 use crate::protocol::{decode_frame, encode_frame, Message, ProtocolError};
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAX_HANDSHAKE_PACKET: usize = 1024;
+const MAX_PAKE_PACKET: usize = 64;
 const NOISE_TAG_BYTES: usize = 16;
 /// The input protocol itself remains limited to its small fixed-size frames.
 /// Pairing needs one bounded configuration exchange, so the secure transport
@@ -29,6 +31,8 @@ pub enum TransportError {
     Io(#[from] io::Error),
     #[error("Noise error: {0}")]
     Noise(#[from] snow::Error),
+    #[error("pairing PAKE error: {0}")]
+    Spake(String),
     #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
     #[error("PSK must be exactly 64 hexadecimal characters")]
@@ -53,6 +57,53 @@ pub struct SecureConnection {
 }
 
 impl SecureConnection {
+    /// Authenticate a short one-time code with SPAKE2, then use the resulting
+    /// strong secret for the normal Noise transport handshake. SPAKE2 prevents
+    /// a passive observer from testing the short code offline.
+    pub fn connect_with_pairing_code(
+        mut stream: TcpStream,
+        role: Role,
+        code: &[u8],
+    ) -> Result<Self, TransportError> {
+        const HOST_ID: &[u8] = b"cachybridge-pairing-host-v1";
+        const CLIENT_ID: &[u8] = b"cachybridge-pairing-client-v1";
+        let password = Password::new(code);
+        let (state, outbound) = match role {
+            Role::Host => Spake2::<Ed25519Group>::start_a(
+                &password,
+                &Identity::new(HOST_ID),
+                &Identity::new(CLIENT_ID),
+            ),
+            Role::Client => Spake2::<Ed25519Group>::start_b(
+                &password,
+                &Identity::new(HOST_ID),
+                &Identity::new(CLIENT_ID),
+            ),
+        };
+        let mut inbound = [0_u8; MAX_PAKE_PACKET];
+        let key = match role {
+            Role::Host => {
+                write_record(&mut stream, &outbound, MAX_PAKE_PACKET)?;
+                let len = read_record(&mut stream, &mut inbound, MAX_PAKE_PACKET)?;
+                state
+                    .finish(&inbound[..len])
+                    .map_err(|error| TransportError::Spake(error.to_string()))?
+            }
+            Role::Client => {
+                let len = read_record(&mut stream, &mut inbound, MAX_PAKE_PACKET)?;
+                write_record(&mut stream, &outbound, MAX_PAKE_PACKET)?;
+                state
+                    .finish(&inbound[..len])
+                    .map_err(|error| TransportError::Spake(error.to_string()))?
+            }
+        };
+        let psk: [u8; 32] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| TransportError::InvalidNoisePacket)?;
+        Self::connect(stream, role, &psk)
+    }
+
     pub fn connect(stream: TcpStream, role: Role, psk: &[u8; 32]) -> Result<Self, TransportError> {
         // Input records are tiny and latency-sensitive. Nagle's algorithm can
         // hold a pointer update while it waits for an ACK from the preceding

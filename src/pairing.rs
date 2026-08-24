@@ -12,9 +12,7 @@ use thiserror::Error;
 
 use crate::{config::RelativePlacement, transport::TransportError};
 
-const CODE_BYTES: usize = 16;
-const CODE_SYMBOLS: usize = 26;
-const PAIRING_LABEL: &[u8; CODE_BYTES] = b"CachyBridgePair!";
+const CODE_SYMBOLS: usize = 5;
 
 #[derive(Debug, Error)]
 pub enum PairingError {
@@ -52,25 +50,26 @@ pub struct PairGrant {
 }
 
 pub fn generate_code() -> String {
-    let mut code = [0_u8; CODE_BYTES];
-    rand::thread_rng().fill_bytes(&mut code);
-    encode_code(&code)
+    let value = rand::thread_rng().next_u32() & 0x01ff_ffff;
+    (0..CODE_SYMBOLS)
+        .rev()
+        .map(|index| base32_symbol(((value >> (index * 5)) & 31) as u8))
+        .collect()
 }
 
-/// Turns a displayed code into the temporary Noise PSK.  The underlying code
-/// is 128-bit random; a label-derived second half prevents accidental reuse as
-/// a long-term application key while preserving its full entropy.
-pub fn temporary_psk(code: &str) -> Result<[u8; 32], PairingError> {
-    let code = decode_code(code)?;
-    let mut psk = [0_u8; 32];
-    psk[..CODE_BYTES].copy_from_slice(&code);
-    for (target, (secret, label)) in psk[CODE_BYTES..]
-        .iter_mut()
-        .zip(code.iter().zip(PAIRING_LABEL.iter()))
-    {
-        *target = secret ^ label;
+/// Normalize a human-entered five-character code before giving it to SPAKE2.
+/// A PAKE lets this deliberately short code authenticate the exchange without
+/// enabling an offline dictionary attack on captured pairing traffic.
+pub fn normalize_code(text: &str) -> Result<String, PairingError> {
+    let symbols: Vec<u8> = text
+        .bytes()
+        .filter(|byte| !matches!(byte, b'-' | b' '))
+        .map(base32_value)
+        .collect::<Result<_, _>>()?;
+    if symbols.len() != CODE_SYMBOLS {
+        return Err(PairingError::InvalidCode);
     }
-    Ok(psk)
+    Ok(symbols.into_iter().map(base32_symbol).collect())
 }
 
 pub fn encode_request(request: &PairRequest) -> Result<Vec<u8>, PairingError> {
@@ -138,62 +137,6 @@ pub fn checked_endpoint(ip: IpAddr, port: u16) -> Result<std::net::SocketAddr, P
         return Err(PairingError::InvalidPort);
     }
     Ok((ip, port).into())
-}
-
-fn encode_code(code: &[u8; CODE_BYTES]) -> String {
-    let mut symbols = String::with_capacity(CODE_SYMBOLS + 5);
-    let mut buffer = 0_u32;
-    let mut bits = 0_u8;
-    for byte in code {
-        buffer = (buffer << 8) | u32::from(*byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            let value = ((buffer >> bits) & 31) as u8;
-            symbols.push(base32_symbol(value));
-        }
-    }
-    if bits > 0 {
-        symbols.push(base32_symbol(((buffer << (5 - bits)) & 31) as u8));
-    }
-    symbols.chars().enumerate().fold(
-        String::with_capacity(CODE_SYMBOLS + 5),
-        |mut grouped, (index, symbol)| {
-            if index > 0 && index % 5 == 0 {
-                grouped.push('-');
-            }
-            grouped.push(symbol);
-            grouped
-        },
-    )
-}
-
-fn decode_code(text: &str) -> Result<[u8; CODE_BYTES], PairingError> {
-    let symbols: Vec<u8> = text
-        .bytes()
-        .filter(|byte| !matches!(byte, b'-' | b' '))
-        .map(base32_value)
-        .collect::<Result<_, _>>()?;
-    if symbols.len() != CODE_SYMBOLS {
-        return Err(PairingError::InvalidCode);
-    }
-    let mut result = [0_u8; CODE_BYTES];
-    let mut buffer = 0_u32;
-    let mut bits = 0_u8;
-    let mut output = 0;
-    for symbol in symbols {
-        buffer = (buffer << 5) | u32::from(symbol);
-        bits += 5;
-        while bits >= 8 && output < CODE_BYTES {
-            bits -= 8;
-            result[output] = (buffer >> bits) as u8;
-            output += 1;
-        }
-    }
-    if output != CODE_BYTES || (bits > 0 && (buffer & ((1 << bits) - 1)) != 0) {
-        return Err(PairingError::InvalidCode);
-    }
-    Ok(result)
 }
 
 fn base32_symbol(value: u8) -> char {
@@ -305,15 +248,15 @@ mod tests {
     fn pairing_codes_normalize_case_and_grouping() {
         let code = generate_code();
         assert_eq!(
-            temporary_psk(&code).unwrap(),
-            temporary_psk(&code.replace('-', "").to_lowercase()).unwrap()
+            normalize_code(&code).unwrap(),
+            normalize_code(&code.to_lowercase()).unwrap()
         );
     }
 
     #[test]
     fn generated_code_round_trips() {
         let code = generate_code();
-        assert_eq!(decode_code(&code).unwrap().len(), CODE_BYTES);
+        assert_eq!(normalize_code(&code).unwrap().len(), CODE_SYMBOLS);
     }
 
     #[test]

@@ -20,8 +20,8 @@ The Qt 6 Widgets wizard offers the normal **Easy one-time pairing** flow:
 
 1. On the controlled client iMac, choose **Show one-time code on this client
    iMac**.
-2. On the input-owner host iMac, choose **Connect host to client with code**,
-   entering the client LAN address, displayed code, and client placement.
+2. On the input-owner host iMac, choose **Find nearby clients**, select the
+   discovered client, then enter the displayed code and client placement.
 3. Both machines save the new peer automatically; the code expires after five
    minutes and works for one successful join only.
 
@@ -38,11 +38,15 @@ For an installed build, place `cachybridge` and `cachybridge-setup` in the same
 binary directory and run `cachybridge setup`. Use `--config PATH` to work with
 a non-default v4 configuration file.
 
-One-time codes carry 128 bits of OS-random entropy in grouped Base32. They
-authenticate a temporary encrypted pairing connection, which transfers a
-fresh 256-bit long-term key; the displayed code is never saved. The manual
-PSK path delegates validation and saving to `cachybridge peer-add`; its tokens
-are passed through owner-only temporary files, never process arguments. The
+One-time codes are five easy-to-type Base32 characters. They are authenticated
+with SPAKE2 before the normal Noise handshake, preventing an observer from
+checking captured pairing traffic against the short code offline. The temporary
+encrypted connection transfers a fresh 256-bit long-term key; the displayed
+code is never saved. While a client is waiting, it announces only its friendly
+name and pairing port over local mDNS (with a same-subnet UDP fallback), never
+the code or any secret. The manual PSK path delegates validation and saving to
+`cachybridge peer-add`; its tokens are passed through owner-only temporary
+files, never process arguments. The
 persistent-permissions setting is stored per peer in the private v4 config;
 the first configured seamless start requests consent and subsequent starts use
 the portal’s one-time restore tokens. Setup itself never opens a desktop portal
