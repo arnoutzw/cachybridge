@@ -665,13 +665,38 @@ public:
         easyLayout->setContentsMargins(12, 12, 12, 12);
         auto *easyHeading = new QLabel(QStringLiteral("Pair with a five-character, single-use code"));
         easyLayout->addWidget(easyHeading);
+        pairingStatus_ = new QLabel;
+        pairingStatus_->setWordWrap(true);
+        pairingStatus_->setStyleSheet(QStringLiteral(
+            "QLabel { padding: 8px; border-radius: 6px; background: palette(alternate-base); }"));
+        easyLayout->addWidget(pairingStatus_);
+        clientCodeCard_ = new QWidget;
+        clientCodeCard_->setStyleSheet(QStringLiteral(
+            "QWidget { padding: 10px; border: 2px solid palette(highlight); border-radius: 8px; }"));
+        auto *codeCardLayout = new QVBoxLayout(clientCodeCard_);
+        auto *codeHeading = new QLabel(QStringLiteral("Give this code to the host"));
+        codeHeading->setAlignment(Qt::AlignCenter);
+        pairingCodeDisplay_ = new QLabel(QStringLiteral("—"));
+        QFont codeFont = pairingCodeDisplay_->font();
+        codeFont.setPointSize(std::max(codeFont.pointSize() + 18, 30));
+        codeFont.setBold(true);
+        pairingCodeDisplay_->setFont(codeFont);
+        pairingCodeDisplay_->setAlignment(Qt::AlignCenter);
+        pairingCodeDisplay_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        pairingAddressDisplay_ = new QLabel;
+        pairingAddressDisplay_->setAlignment(Qt::AlignCenter);
+        pairingAddressDisplay_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        codeCardLayout->addWidget(codeHeading);
+        codeCardLayout->addWidget(pairingCodeDisplay_);
+        codeCardLayout->addWidget(pairingAddressDisplay_);
+        easyLayout->addWidget(clientCodeCard_);
         auto *hostButton = new QPushButton(QStringLiteral("Show one-time code on this client iMac"));
         hostButton->setToolTip(QStringLiteral(
             "Starts a five-minute listener. On the input-owner host, enter this client's LAN address and the displayed code."));
         connect(hostButton, &QPushButton::clicked, this, [this, hostButton] {
             if (hostPairingProcess_) {
-                QMessageBox::information(this, QStringLiteral("Pairing is already open"),
-                    QStringLiteral("This iMac is already waiting for one device to join."));
+                pairingStatus_->setText(QStringLiteral(
+                    "This client is already waiting for a host to enter the displayed code."));
                 return;
             }
             // The persistent client listener uses the same LAN-approved port
@@ -701,10 +726,11 @@ public:
             }
             const QString address = localLanAddress();
             hostButton->setEnabled(false);
-            QMessageBox::information(this, QStringLiteral("Pairing code — valid for five minutes"),
-                QStringLiteral("On the input-owner host, choose ‘Connect host to client with code’ and enter:\n\n"
-                    "Client address: %1:45232\nCode: %2\n\nThis code works once and is not saved.")
-                    .arg(address, code));
+            pairingCodeDisplay_->setText(code);
+            pairingAddressDisplay_->setText(QStringLiteral("Client IP: %1:45232").arg(address));
+            clientCodeCard_->setVisible(true);
+            pairingStatus_->setText(QStringLiteral(
+                "Waiting for the host. This code expires in five minutes and works once."));
             connect(hostPairingProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
                 [this, hostButton](int exitCode, QProcess::ExitStatus status) {
                     const QString details = QString::fromUtf8(hostPairingProcess_->readAllStandardError()).trimmed();
@@ -716,15 +742,16 @@ public:
                     if (status == QProcess::NormalExit && exitCode == 0 && !peerId.isEmpty()) {
                         const QString serviceError = startClientSession(peerId);
                         if (serviceError.isEmpty()) {
-                            QMessageBox::information(this, QStringLiteral("Client ready"),
-                                QStringLiteral("Pairing is complete and this iMac is now listening for the host."));
+                            pairingStatus_->setText(QStringLiteral(
+                                "Pairing complete. Approve the desktop-portal prompt if shown; this client is then ready for the host."));
                         } else {
-                            QMessageBox::warning(this, QStringLiteral("Pairing saved, client not started"),
-                                serviceError);
+                            pairingStatus_->setText(QStringLiteral(
+                                "Pairing was saved, but the client listener could not start: %1").arg(serviceError));
                         }
                     } else {
-                        QMessageBox::warning(this, QStringLiteral("Pairing ended"),
-                            details.isEmpty() ? QStringLiteral("The code expired or pairing was not completed.") : details);
+                        pairingStatus_->setText(details.isEmpty()
+                            ? QStringLiteral("Pairing ended. The code expired or was not completed.")
+                            : QStringLiteral("Pairing ended: %1").arg(details));
                     }
                 });
         });
@@ -795,31 +822,31 @@ public:
             const PairJoinDraft draft{hostName_->text().trimmed(), pairingAddress_->text().trimmed(),
                 pairingCode_->text().trimmed(), selectedPlacement(), persistent_->isChecked()};
             if (draft.localName.isEmpty() || draft.clientAddress.isEmpty() || draft.code.isEmpty()) {
-                QMessageBox::warning(this, QStringLiteral("Pairing details needed"),
-                    QStringLiteral("Enter this host's name, the client address, and its displayed code."));
+                pairingStatus_->setText(QStringLiteral(
+                    "Enter this host's name, the client address, and the displayed code."));
                 return;
             }
             QString peerId;
             const QString error = store_->connectPairHost(draft, &peerId);
             if (!error.isEmpty()) {
-                QMessageBox::warning(this, QStringLiteral("Could not join"), error);
+                pairingStatus_->setText(QStringLiteral("Could not pair: %1").arg(error));
                 return;
             }
             activePeerId_ = peerId;
-            QMessageBox::information(this, QStringLiteral("Pairing complete"),
-                QStringLiteral("Pairing was saved. Starting the sharing session now…"));
+            pairingStatus_->setText(QStringLiteral(
+                "Pairing saved. Starting the sharing session; approve a portal prompt if Plasma shows one."));
             // The client starts RemoteDesktop and InputCapture portal sessions
             // before it opens its listener. The host CLI now waits up to a
             // minute for that listener, which covers a first-use portal prompt.
             QTimer::singleShot(3000, this, [this, peerId] {
                 const QString serviceError = startHostSession(peerId);
                 if (!serviceError.isEmpty()) {
-                    QMessageBox::warning(this, QStringLiteral("Pairing saved, host not started"),
-                        serviceError);
+                    pairingStatus_->setText(QStringLiteral(
+                        "Pairing was saved, but the host session could not start: %1").arg(serviceError));
                     return;
                 }
-                QMessageBox::information(this, QStringLiteral("CachyBridge connected"),
-                    QStringLiteral("The host session has started. Approve a desktop-portal prompt if Plasma shows one."));
+                pairingStatus_->setText(QStringLiteral(
+                    "Host session started. It will wait for the client while any desktop-portal approval is completed."));
             });
         });
         auto *joinForm = new QFormLayout;
@@ -830,12 +857,12 @@ public:
             QString error;
             const QStringList clients = store_->discoverPairClients(&error);
             if (!error.isEmpty()) {
-                QMessageBox::warning(this, QStringLiteral("Discovery failed"), error);
+                pairingStatus_->setText(QStringLiteral("Discovery failed: %1").arg(error));
                 return;
             }
             if (clients.isEmpty()) {
-                QMessageBox::information(this, QStringLiteral("No client found"),
-                    QStringLiteral("Open setup on the client and choose ‘Show one-time code on this client iMac’."));
+                pairingStatus_->setText(QStringLiteral(
+                    "No client found. Open setup on the client and show its one-time code first."));
                 return;
             }
             QString selected = clients.first();
@@ -962,6 +989,10 @@ public:
         hostButton->setVisible(role_ == MachineRole::Client);
         firewallButton->setVisible(role_ == MachineRole::Client);
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
+        clientCodeCard_->setVisible(false);
+        pairingStatus_->setText(role_ == MachineRole::Host
+            ? QStringLiteral("Enter the client’s address and displayed code, or find a nearby client.")
+            : QStringLiteral("Create a code here, then enter it from the host iMac."));
         tabs->setTabEnabled(2, role_ == MachineRole::Host);
     }
 
@@ -1115,6 +1146,10 @@ private:
     QSpinBox *clientWidth_ = nullptr;
     QSpinBox *clientHeight_ = nullptr;
     QCheckBox *persistent_ = nullptr;
+    QLabel *pairingStatus_ = nullptr;
+    QWidget *clientCodeCard_ = nullptr;
+    QLabel *pairingCodeDisplay_ = nullptr;
+    QLabel *pairingAddressDisplay_ = nullptr;
     QProcess *hostPairingProcess_ = nullptr;
     QWidget *hostConnectPanel_ = nullptr;
     QString activePeerId_;
