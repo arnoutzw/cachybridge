@@ -5,7 +5,11 @@
 //! an authenticated `EnterAck` is required before any `Input` is sent or
 //! injected, and every close/error path first releases local/remote input.
 
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 
@@ -22,6 +26,7 @@ use crate::{
 pub struct RemoteDesktopInjector {
     session: crate::remote_spike::RemoteDesktopSession,
     entry: Option<Point>,
+    motion_rate: MotionRate,
 }
 
 /// Adapter from the reusable InputCapture session and typed libei receiver to
@@ -37,7 +42,41 @@ pub struct InputCaptureAdapter {
     /// scrolling stay ordered and uncoalesced; pointer motion is safe to
     /// batch and avoids a burst of individually framed network packets.
     pending_motion: (i32, i32),
+    motion_rate: MotionRate,
     pending: VecDeque<CapturedInput>,
+}
+
+/// One-second moving report used to distinguish compositor capture cadence
+/// from network/injection issues in a real seamless session.
+#[derive(Debug)]
+struct MotionRate {
+    label: &'static str,
+    window_started: Instant,
+    samples: u64,
+}
+
+impl MotionRate {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            window_started: Instant::now(),
+            samples: 0,
+        }
+    }
+
+    fn record(&mut self) {
+        self.samples += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "motion {}: {:.1} paired samples/s",
+                self.label,
+                self.samples as f64 / elapsed.as_secs_f64()
+            );
+            self.window_started = Instant::now();
+            self.samples = 0;
+        }
+    }
 }
 
 /// Typed input leaving the portal capture adapter. Pointer motion has its own
@@ -189,6 +228,7 @@ impl InputCaptureAdapter {
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
+            motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
     }
@@ -205,6 +245,7 @@ impl InputCaptureAdapter {
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
+            motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
     }
@@ -221,6 +262,7 @@ impl InputCaptureAdapter {
     fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_motion);
         if dx != 0 || dy != 0 {
+            self.motion_rate.record();
             self.pending.push_back(CapturedInput::Motion { dx, dy });
         }
     }
@@ -474,6 +516,7 @@ impl RemoteDesktopInjector {
         Ok(Self {
             session: crate::remote_spike::RemoteDesktopSession::start()?,
             entry: None,
+            motion_rate: MotionRate::new("injection"),
         })
     }
 
@@ -485,6 +528,7 @@ impl RemoteDesktopInjector {
                 persistence,
             )?,
             entry: None,
+            motion_rate: MotionRate::new("injection"),
         })
     }
 
@@ -514,7 +558,9 @@ impl InjectBackend for RemoteDesktopInjector {
     }
 
     fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()> {
-        self.session.inject_relative(f64::from(dx), f64::from(dy))
+        self.session.inject_relative(f64::from(dx), f64::from(dy))?;
+        self.motion_rate.record();
+        Ok(())
     }
 
     fn inject(&mut self, event: WireInputEvent) -> io::Result<()> {
