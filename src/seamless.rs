@@ -758,6 +758,10 @@ pub struct SeamlessClient<I, T> {
     injector: I,
     transport: T,
     remote_active: bool,
+    /// Set after the controlled-side barrier has asked the host to return
+    /// input. A final host motion record can already be in flight; it is
+    /// stale rather than a protocol violation and must be discarded.
+    return_pending: bool,
 }
 
 impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
@@ -766,6 +770,7 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
             injector,
             transport,
             remote_active: false,
+            return_pending: false,
         }
     }
 
@@ -797,6 +802,7 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 }
                 self.transport.send(Message::EnterAck)?;
                 self.remote_active = true;
+                self.return_pending = false;
                 Ok(())
             }
             Message::Enter { .. } => {
@@ -808,11 +814,23 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 Ok(())
             }
             Message::Input(_) => {
+                if self.return_pending {
+                    // The host may have selected this input before receiving
+                    // our ExitRequest. Never inject it after releasing the
+                    // client side, but keep the encrypted session alive for
+                    // the HandoffRelease acknowledgement and next entry.
+                    return Ok(());
+                }
                 let _ = self.close();
                 Err(SeamlessError::InputBeforeEntry)
             }
             Message::Heartbeat => Ok(()),
-            Message::HandoffRelease | Message::ReleaseAll | Message::Goodbye => self.close(),
+            Message::HandoffRelease => {
+                self.close()?;
+                self.return_pending = false;
+                Ok(())
+            }
+            Message::ReleaseAll | Message::Goodbye => self.close(),
             message => {
                 let _ = self.close();
                 Err(SeamlessError::UnexpectedControl(message))
@@ -832,6 +850,7 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
             x: position.x,
             y: position.y,
         })?;
+        self.return_pending = true;
         self.close()
     }
 
@@ -1143,6 +1162,39 @@ mod tests {
                     x: -1,
                     y: 500,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn client_discards_an_in_flight_motion_after_requesting_return() {
+        let mut client = SeamlessClient::new(FakeInject::default(), FakeTransport::default());
+        client.handle(Message::Enter { x: -1, y: 500 }).unwrap();
+        client
+            .request_exit(WireEdge::Right, Point { x: -1, y: 500 })
+            .unwrap();
+        client
+            .handle(Message::Input(WireInputEvent {
+                event_type: 2,
+                code: 0,
+                value: 4,
+            }))
+            .unwrap();
+        client.handle(Message::HandoffRelease).unwrap();
+        client.handle(Message::Enter { x: -1, y: 600 }).unwrap();
+        let (injector, transport) = client.into_parts();
+        assert!(injector.inputs.is_empty());
+        assert_eq!(injector.releases, 2);
+        assert_eq!(
+            transport.sent,
+            vec![
+                Message::EnterAck,
+                Message::ExitRequest {
+                    edge: WireEdge::Right,
+                    x: -1,
+                    y: 500,
+                },
+                Message::EnterAck,
             ]
         );
     }
