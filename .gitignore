@@ -1,0 +1,9 @@
+# Build products and local integration-test state.
+/target/
+/work/
+/outputs/
+
+# Pairing and portal credentials must never enter version control.
+*.psk
+*.token
+config.v4

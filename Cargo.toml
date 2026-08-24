@@ -1,0 +1,17 @@
+[package]
+name = "cachybridge"
+version = "4.0.0"
+edition = "2021"
+license = "MIT"
+description = "CachyOS LAN mouse and keyboard sharing with Wayland portal integration"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+evdev = "0.12"
+hex = "0.4"
+rand = "0.8"
+snow = "0.9"
+thiserror = "1.0"
+zbus = "5.19"
+
+[dev-dependencies]
