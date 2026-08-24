@@ -35,7 +35,7 @@ pub struct RemoteDesktopInjector {
 /// disabling capture.
 pub struct InputCaptureAdapter {
     session: crate::portal_spike::InputCaptureSession,
-    local_left_x: i32,
+    local_edge_x: i32,
     active_activation: Option<u32>,
     absolute_motion: AbsoluteMotionTracker,
     /// One coalesced relative move per receiver dispatch. Buttons, keys and
@@ -87,37 +87,39 @@ pub enum CapturedInput {
     Event(WireInputEvent),
 }
 
-/// Watches the controlled client's right InputCapture barrier. It is separate
+/// Watches the controlled client's outer InputCapture barrier. It is separate
 /// from RemoteDesktop injection because a return request is a local portal
 /// activation, not a network input event.
-pub struct RightEdgeReturnWatcher {
+pub struct EdgeReturnWatcher {
     session: crate::portal_spike::InputCaptureSession,
-    wire_right_x: i32,
+    edge: WireEdge,
     wire_y_offset: i32,
 }
 
-impl RightEdgeReturnWatcher {
-    pub fn start(
-        wire_right_x: i32,
-        wire_y_offset: i32,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+impl EdgeReturnWatcher {
+    pub fn start(edge: WireEdge, wire_y_offset: i32) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            session: crate::portal_spike::InputCaptureSession::start_right()?,
-            wire_right_x,
+            session: crate::portal_spike::InputCaptureSession::start(
+                capture_edge(edge),
+                crate::portal_spike::CaptureCapabilities::PointerOnly,
+            )?,
+            edge,
             wire_y_offset,
         })
     }
 
     pub fn start_with_persistence(
-        wire_right_x: i32,
+        edge: WireEdge,
         wire_y_offset: i32,
         persistence: crate::portal_persistence::PortalPersistence,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            session: crate::portal_spike::InputCaptureSession::start_right_with_persistence(
+            session: crate::portal_spike::InputCaptureSession::start_with_persistence(
+                capture_edge(edge),
+                crate::portal_spike::CaptureCapabilities::PointerOnly,
                 persistence,
             )?,
-            wire_right_x,
+            edge,
             wire_y_offset,
         })
     }
@@ -126,9 +128,9 @@ impl RightEdgeReturnWatcher {
         self.session.take_restore_token()
     }
 
-    /// Polls the target's outer right barrier. On activation it releases the
-    /// exact target capture before handing the position to the transport layer.
-    pub fn poll_exit(&mut self) -> io::Result<Option<Point>> {
+    /// Polls the target's outer barrier. On activation it releases the exact
+    /// target capture before handing its edge and y position to transport.
+    pub fn poll_exit(&mut self) -> io::Result<Option<(WireEdge, i32)>> {
         match self.session.poll_signal(Duration::ZERO)? {
             Some(crate::portal_spike::CaptureSignal::Activated {
                 activation_id,
@@ -138,18 +140,18 @@ impl RightEdgeReturnWatcher {
                 self.session
                     .release(activation_id, None)
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                Ok(Some(Point {
-                    x: self.wire_right_x,
-                    y: rounded_coordinate(y)?
+                Ok(Some((
+                    self.edge,
+                    rounded_coordinate(y)?
                         .checked_add(self.wire_y_offset)
                         .ok_or_else(|| {
                             io::Error::new(io::ErrorKind::InvalidData, "return cursor y overflow")
                         })?,
-                }))
+                )))
             }
             Some(crate::portal_spike::CaptureSignal::Activated { .. }) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "right-edge activation omitted a finite cursor position",
+                "edge activation omitted a finite cursor position",
             )),
             // Release intentionally produces a Deactivated signal. It is the
             // expected completion of a right-edge return, not a reason to
@@ -167,6 +169,13 @@ impl RightEdgeReturnWatcher {
         self.session
             .close()
             .map_err(|error| io::Error::other(error.to_string()))
+    }
+}
+
+fn capture_edge(edge: WireEdge) -> crate::portal_spike::CaptureEdge {
+    match edge {
+        WireEdge::Left => crate::portal_spike::CaptureEdge::Left,
+        WireEdge::Right => crate::portal_spike::CaptureEdge::Right,
     }
 }
 
@@ -221,10 +230,16 @@ impl AbsoluteMotionTracker {
 }
 
 impl InputCaptureAdapter {
-    pub fn start_left(local_left_x: i32) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn start(
+        edge: crate::portal_spike::CaptureEdge,
+        local_edge_x: i32,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            session: crate::portal_spike::InputCaptureSession::start_left()?,
-            local_left_x,
+            session: crate::portal_spike::InputCaptureSession::start(
+                edge,
+                crate::portal_spike::CaptureCapabilities::KeyboardPointer,
+            )?,
+            local_edge_x,
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
@@ -233,21 +248,39 @@ impl InputCaptureAdapter {
         })
     }
 
-    pub fn start_left_with_persistence(
-        local_left_x: i32,
+    pub fn start_with_persistence(
+        edge: crate::portal_spike::CaptureEdge,
+        local_edge_x: i32,
         persistence: crate::portal_persistence::PortalPersistence,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            session: crate::portal_spike::InputCaptureSession::start_left_with_persistence(
+            session: crate::portal_spike::InputCaptureSession::start_with_persistence(
+                edge,
+                crate::portal_spike::CaptureCapabilities::KeyboardPointer,
                 persistence,
             )?,
-            local_left_x,
+            local_edge_x,
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
+    }
+
+    pub fn start_left(local_left_x: i32) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start(crate::portal_spike::CaptureEdge::Left, local_left_x)
+    }
+
+    pub fn start_left_with_persistence(
+        local_left_x: i32,
+        persistence: crate::portal_persistence::PortalPersistence,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_persistence(
+            crate::portal_spike::CaptureEdge::Left,
+            local_left_x,
+            persistence,
+        )
     }
 
     pub fn take_restore_token(&mut self) -> Option<crate::portal_persistence::RestoreToken> {
@@ -319,7 +352,7 @@ impl CaptureBackend for InputCaptureAdapter {
                         // A left-edge barrier is the capture session's only
                         // activation source; use configured logical edge to
                         // avoid accepting portal overshoot as an interior x.
-                        x: self.local_left_x,
+                        x: self.local_edge_x,
                         y: rounded_coordinate(y)?,
                     });
                 }
@@ -829,6 +862,7 @@ pub struct SeamlessClient<I, T> {
     injector: I,
     transport: T,
     remote_active: bool,
+    entry: Option<Point>,
     /// Set after the controlled-side barrier has asked the host to return
     /// input. A final host motion record can already be in flight; it is
     /// stale rather than a protocol violation and must be discarded.
@@ -841,12 +875,20 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
             injector,
             transport,
             remote_active: false,
+            entry: None,
             return_pending: false,
         }
     }
 
     pub const fn remote_active(&self) -> bool {
         self.remote_active
+    }
+
+    /// The last authenticated host entry.  A left-side client needs its x
+    /// coordinate when it returns across its left barrier because that is the
+    /// adjoining host's right boundary in the shared topology.
+    pub const fn entry(&self) -> Option<Point> {
+        self.entry
     }
 
     /// Receives one encrypted frame. Keeping this narrow wrapper avoids
@@ -874,6 +916,7 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 self.transport.send(Message::EnterAck)?;
                 self.remote_active = true;
                 self.return_pending = false;
+                self.entry = Some(Point { x, y });
                 Ok(())
             }
             Message::Enter { .. } => {
@@ -940,6 +983,7 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
     /// Releases virtual pressed state even after an error/disconnect.
     pub fn close(&mut self) -> Result<(), SeamlessError> {
         self.remote_active = false;
+        self.entry = None;
         self.injector.release_all().map_err(Into::into)
     }
 

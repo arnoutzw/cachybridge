@@ -251,10 +251,9 @@ private:
         const QPointF hostCenter = hostRect_.center();
         const QPointF clientCenter = position + clientTile_->rect().center();
         const QPointF delta = clientCenter - hostCenter;
-        if (std::abs(delta.x()) >= std::abs(delta.y()))
-            placement_ = delta.x() < 0 ? Placement::Left : Placement::Right;
-        else
-            placement_ = delta.y() < 0 ? Placement::Above : Placement::Below;
+        // Current portal capture supports horizontal barriers.  A vertical
+        // drop intentionally resolves to a usable left/right placement.
+        placement_ = delta.x() < 0 ? Placement::Left : Placement::Right;
         rebuild();
     }
 
@@ -308,6 +307,8 @@ public:
                                     QProcess *process) = 0;
     virtual QString connectPairHost(const PairJoinDraft &draft, QString *peerId) = 0;
     virtual QStringList discoverPairClients(QString *error) = 0;
+    virtual QStringList configuredPeers(QString *error) = 0;
+    virtual QString applyTopology(const QString &peerId, Placement placement) = 0;
     virtual QString ensureClientFirewall() = 0;
     virtual QString save(const SetupDraft &draft) = 0;
 };
@@ -440,6 +441,40 @@ public:
         }
         return QString::fromUtf8(process.readAllStandardOutput())
             .split(u'\n', Qt::SkipEmptyParts);
+    }
+
+    QStringList configuredPeers(QString *error) override {
+        QProcess process;
+        QStringList arguments{QStringLiteral("peer-list")};
+        if (!configPath_.isEmpty()) arguments << QStringLiteral("--config") << configPath_;
+        process.start(cachybridge_, arguments);
+        if (!process.waitForStarted() || !process.waitForFinished(5000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const QString details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            *error = details.isEmpty() ? QStringLiteral("Could not read saved pairings.") : details;
+            return {};
+        }
+        return QString::fromUtf8(process.readAllStandardOutput())
+            .split(u'\n', Qt::SkipEmptyParts);
+    }
+
+    QString applyTopology(const QString &peerId, Placement placement) override {
+        QProcess process;
+        QStringList arguments{QStringLiteral("topology-apply"), QStringLiteral("--peer"), peerId,
+            QStringLiteral("--placement"), placementName(placement)};
+        if (!configPath_.isEmpty()) arguments << QStringLiteral("--config") << configPath_;
+        process.start(cachybridge_, arguments);
+        if (!process.waitForStarted())
+            return QStringLiteral("Could not start %1: %2").arg(cachybridge_, process.errorString());
+        if (!process.waitForFinished(15000)) {
+            process.kill();
+            return QStringLiteral("The client did not acknowledge the topology change in time.");
+        }
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const QString details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            return details.isEmpty() ? QStringLiteral("The client rejected the topology change.") : details;
+        }
+        return {};
     }
 
     QString ensureClientFirewall() override {
@@ -602,6 +637,14 @@ public:
                     QStringLiteral("This iMac is already waiting for one device to join."));
                 return;
             }
+            // The persistent client listener uses the same LAN-approved port
+            // as one-time pairing. Stop it first so a re-pair never races a
+            // running sharing session for that port.
+            const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
+            if (!systemctl.isEmpty()) {
+                QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"),
+                    QStringLiteral("cachybridge-seamless-client")});
+            }
             const QString firewallError = store_->ensureClientFirewall();
             if (!firewallError.isEmpty()) {
                 QMessageBox::warning(this, QStringLiteral("LAN access is required"), firewallError);
@@ -668,6 +711,7 @@ public:
                 QMessageBox::warning(this, QStringLiteral("Could not join"), error);
                 return;
             }
+            activePeerId_ = peerId;
             QMessageBox::information(this, QStringLiteral("Pairing complete"),
                 QStringLiteral("Pairing was saved. Starting the sharing session now…"));
             // The client pairing process switches into its regular listener
@@ -724,7 +768,8 @@ public:
         auto *placementLayout = new QVBoxLayout(placementBox);
         placementLayout->setContentsMargins(12, 12, 12, 12);
         auto *hint = new QLabel(QStringLiteral(
-            "Drag the client tile to an edge of the host tile. Tile sizes reflect the selected display resolutions."));
+            "Drag the client tile left or right of the host. Tile sizes reflect the selected display resolutions. "
+            "Apply & reconnect updates both iMacs and re-arms the matching cursor edge."));
         hint->setWordWrap(true);
         placementPreview_ = new DisplayLayoutPreview;
         clientWidth_ = new QSpinBox;
@@ -748,6 +793,47 @@ public:
         placementLayout->addWidget(hint);
         placementLayout->addWidget(placementPreview_);
         placementLayout->addLayout(resolutionForm);
+        auto *applyPlacement = new QPushButton(QStringLiteral("Apply & reconnect"));
+        applyPlacement->setToolTip(QStringLiteral(
+            "Saves this layout on both paired iMacs, releases active input, then starts a fresh host session."));
+        connect(applyPlacement, &QPushButton::clicked, this, [this] {
+            QString peerId = activePeerId_;
+            if (peerId.isEmpty()) {
+                QString error;
+                const QStringList peers = store_->configuredPeers(&error);
+                if (!error.isEmpty()) {
+                    QMessageBox::warning(this, QStringLiteral("Could not read pairings"), error);
+                    return;
+                }
+                if (peers.isEmpty()) {
+                    QMessageBox::information(this, QStringLiteral("No paired client"),
+                        QStringLiteral("Pair a client first, then return here to apply its placement."));
+                    return;
+                }
+                QString selected = peers.first();
+                if (peers.size() > 1) {
+                    bool accepted = false;
+                    selected = QInputDialog::getItem(this, QStringLiteral("Choose paired client"),
+                        QStringLiteral("Client"), peers, 0, false, &accepted);
+                    if (!accepted) return;
+                }
+                peerId = selected.section(u'\t', 0, 0);
+            }
+            const QString updateError = store_->applyTopology(peerId, selectedPlacement());
+            if (!updateError.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Could not apply placement"), updateError);
+                return;
+            }
+            activePeerId_ = peerId;
+            const QString serviceError = startHostSession(peerId);
+            if (!serviceError.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Placement saved, host not restarted"), serviceError);
+                return;
+            }
+            QMessageBox::information(this, QStringLiteral("Placement applied"),
+                QStringLiteral("The session is reconnecting with the new cursor boundary."));
+        });
+        placementLayout->addWidget(applyPlacement);
 
         persistent_ = new QCheckBox(
             QStringLiteral("Remember desktop portal permissions (recommended on these two iMacs)"));
@@ -788,7 +874,8 @@ private:
         return screen ? screen->size() : QSize(2560, 1440);
     }
 
-    QString startUserService(const QString &unit, const QStringList &command) const {
+    QString startUserService(const QString &unit, const QStringList &command,
+                             bool restartOnFailure = false) const {
         const QString systemdRun = QStandardPaths::findExecutable(QStringLiteral("systemd-run"));
         const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
         if (systemdRun.isEmpty() || systemctl.isEmpty())
@@ -800,7 +887,8 @@ private:
 
         QStringList arguments{
             QStringLiteral("--user"), QStringLiteral("--unit=") + unit,
-            QStringLiteral("--collect"), QStringLiteral("--property=Restart=no"),
+            QStringLiteral("--collect"), QStringLiteral("--property=Restart=")
+                + (restartOnFailure ? QStringLiteral("on-failure") : QStringLiteral("no")),
         };
         for (const QString &name : {QStringLiteral("XDG_RUNTIME_DIR"),
                                     QStringLiteral("DBUS_SESSION_BUS_ADDRESS"),
@@ -832,7 +920,7 @@ private:
             QStringLiteral("seamless-client-config"), QStringLiteral("--peer"), peerId,
             QStringLiteral("--peer-width"), QString::number(size.width()),
             QStringLiteral("--peer-y"), QStringLiteral("0"),
-        });
+        }, true);
     }
 
     QString startHostSession(const QString &peerId) const {
@@ -932,6 +1020,7 @@ private:
     QCheckBox *persistent_ = nullptr;
     QProcess *hostPairingProcess_ = nullptr;
     QWidget *hostConnectPanel_ = nullptr;
+    QString activePeerId_;
     MachineRole role_;
 };
 

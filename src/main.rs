@@ -28,7 +28,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
-    sync::mpsc::sync_channel,
+    sync::mpsc::{sync_channel, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
 
@@ -45,6 +45,10 @@ use crate::{
 
 const DEFAULT_PORT: u16 = 45_231;
 const DEFAULT_PAIRING_PORT: u16 = 45_232;
+/// Authenticated topology control listener on the controlled peer. It shares
+/// the already-authorized pairing port, but pairing and a running client are
+/// mutually exclusive modes, so no second firewall permission is required.
+const DEFAULT_CONTROL_PORT: u16 = DEFAULT_PAIRING_PORT;
 const INPUT_QUEUE_CAPACITY: usize = 1_024;
 /// The client must service both its local return barrier and remote input.
 /// One millisecond limits the event-driven EIS injection wait without busy
@@ -191,6 +195,19 @@ enum Command {
     },
     /// List configured peers without exposing pairing secrets.
     PeerList {
+        /// Use this configuration file instead of the normal per-user path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Persist a new horizontal peer position on both paired machines, then
+    /// make the controlled side restart its portal session.
+    TopologyApply {
+        /// Configured 32-character peer ID.
+        #[arg(long)]
+        peer: String,
+        /// Position of the controlled client relative to this host.
+        #[arg(long, value_enum)]
+        placement: CliPlacement,
         /// Use this configuration file instead of the normal per-user path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -599,6 +616,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Command::TopologyApply {
+            peer,
+            placement,
+            config: config_override,
+        } => run_topology_apply(config_override, &peer, placement.into()),
         Command::Devices => {
             let devices = list_input_devices();
             if devices.is_empty() {
@@ -939,6 +961,123 @@ fn opposite_placement(placement: config::RelativePlacement) -> config::RelativeP
     }
 }
 
+fn horizontal_placement(
+    placement: config::RelativePlacement,
+) -> Result<config::RelativePlacement, io::Error> {
+    match placement {
+        config::RelativePlacement::Left | config::RelativePlacement::Right => Ok(placement),
+        config::RelativePlacement::Above | config::RelativePlacement::Below => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "top/bottom layouts are not available yet; choose left or right",
+        )),
+    }
+}
+
+/// Applies the client placement transaction.  The remote side saves first and
+/// acknowledges over the existing pairing PSK; only then is the local config
+/// committed.  Its service exits immediately after the ACK so systemd can
+/// rebuild its portals with the complementary edge.
+fn run_topology_apply(
+    config_override: Option<PathBuf>,
+    peer_id: &str,
+    placement: config::RelativePlacement,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let placement = horizontal_placement(placement)?;
+    let (path, mut bridge_config, peer) = configured_peer(config_override, peer_id)?;
+    let control = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CONTROL_PORT);
+    let stream = TcpStream::connect_timeout(&control, Duration::from_secs(8))?;
+    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(8)))?;
+    let mut connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
+    let request = format!("CBTO1:{}:{}", peer.id, placement.as_str());
+    connection.send_payload(request.as_bytes())?;
+    let ack = connection.receive_payload()?;
+    if ack.as_slice() != b"CBTO1:ok" {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the client rejected the topology update",
+        )
+        .into());
+    }
+    bridge_config.set_peer_placement(peer_id, placement)?;
+    config::save(&path, &bridge_config)?;
+    println!("topology_applied={}", placement.as_str());
+    Ok(())
+}
+
+fn spawn_topology_control_listener(
+    path: PathBuf,
+    peer: config::PeerConfig,
+) -> Result<Receiver<()>, Box<dyn std::error::Error>> {
+    let listen = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CONTROL_PORT);
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let (changed_tx, changed_rx) = sync_channel(1);
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, remote)) => {
+                let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(8)))?;
+                    let mut connection =
+                        SecureConnection::connect(stream, Role::Client, peer.psk())?;
+                    let payload = connection.receive_payload()?;
+                    let request = std::str::from_utf8(&payload).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid topology request")
+                    })?;
+                    let mut fields = request.split(':');
+                    let (Some(version), Some(id), Some(placement), None) =
+                        (fields.next(), fields.next(), fields.next(), fields.next())
+                    else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid topology request",
+                        )
+                        .into());
+                    };
+                    if version != "CBTO1" || !id.eq_ignore_ascii_case(&peer.id) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "topology peer mismatch",
+                        )
+                        .into());
+                    }
+                    let host_placement = match placement {
+                        "left" => config::RelativePlacement::Left,
+                        "right" => config::RelativePlacement::Right,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "unsupported topology",
+                            )
+                            .into())
+                        }
+                    };
+                    let mut config = config::load_or_default(&path)?;
+                    config.set_peer_placement(&peer.id, opposite_placement(host_placement))?;
+                    config::save(&path, &config)?;
+                    connection.send_payload(b"CBTO1:ok")?;
+                    changed_tx.send(()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "client is stopping")
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    eprintln!("ignored topology control request from {remote}: {error}");
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                eprintln!("topology control listener stopped: {error}");
+                return;
+            }
+        }
+    });
+    Ok(changed_rx)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_left_edge_demo(
     peer: SocketAddr,
@@ -1015,22 +1154,44 @@ fn run_seamless_client(
     }
     eprintln!("starting RemoteDesktop and right InputCapture sessions; portal consent is required before listening");
     let injector = seamless::RemoteDesktopInjector::start()?;
-    let return_watcher = seamless::RightEdgeReturnWatcher::start(-1, peer_y)?;
-    run_seamless_client_with_sessions(listen, psk, injector, return_watcher)
+    let return_watcher = seamless::EdgeReturnWatcher::start(protocol::WireEdge::Right, peer_y)?;
+    run_seamless_client_with_sessions(listen, psk, injector, return_watcher, None)
 }
 
 fn run_seamless_client_with_sessions(
     listen: SocketAddr,
     psk: [u8; 32],
     injector: seamless::RemoteDesktopInjector,
-    mut return_watcher: seamless::RightEdgeReturnWatcher,
+    mut return_watcher: seamless::EdgeReturnWatcher,
+    topology_changed: Option<Receiver<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
     eprintln!(
         "seamless client ready; waiting for host on {}",
         listener.local_addr()?
     );
-    let (stream, peer) = listener.accept()?;
+    let (stream, peer) = loop {
+        if let Some(receiver) = &topology_changed {
+            match receiver.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "topology updated; restart client portal session",
+                    )
+                    .into())
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     eprintln!("host TCP connection from {peer}; authenticating");
     let connection = SecureConnection::connect(stream, Role::Client, &psk)?;
     connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
@@ -1038,13 +1199,38 @@ fn run_seamless_client_with_sessions(
     let mut last_peer_message = Instant::now();
 
     let result: Result<(), Box<dyn std::error::Error>> = loop {
+        if let Some(receiver) = &topology_changed {
+            match receiver.try_recv() {
+                Ok(()) | Err(TryRecvError::Disconnected) => {
+                    break Err(Box::new(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "topology updated; restart client portal session",
+                    )))
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         // Always drain portal signals. Otherwise a right-edge activation from
         // before Enter could be mistaken for a return immediately afterward.
         let return_position = return_watcher.poll_exit()?;
         if client.remote_active() {
-            if let Some(position) = return_position {
-                client.request_exit(protocol::WireEdge::Right, position)?;
-                eprintln!("client right-edge return sent; waiting for the next host entry");
+            if let Some((edge, y)) = return_position {
+                let x = match edge {
+                    protocol::WireEdge::Right => -1,
+                    protocol::WireEdge::Left => {
+                        client
+                            .entry()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "left-edge return has no authenticated entry coordinate",
+                                )
+                            })?
+                            .x
+                    }
+                };
+                client.request_exit(edge, handoff::Point { x, y })?;
+                eprintln!("client edge return sent; waiting for the next host entry");
                 continue;
             }
         }
@@ -1095,25 +1281,6 @@ fn configured_peer(
     Ok((path, bridge_config, peer))
 }
 
-fn require_peer_placement(
-    peer: &config::PeerConfig,
-    expected: config::RelativePlacement,
-    runtime_role: &str,
-) -> Result<(), io::Error> {
-    if peer.placement == expected {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "configured placement {} is incompatible with the {runtime_role} runtime; use {}",
-                peer.placement.as_str(),
-                expected.as_str(),
-            ),
-        ))
-    }
-}
-
 fn portal_persistence(
     enabled: bool,
     token: Option<&str>,
@@ -1150,13 +1317,14 @@ fn run_seamless_client_config(
         );
     }
     let (path, mut bridge_config, peer) = configured_peer(config_override, peer_id)?;
-    // A client sees the host to its right and therefore owns the right-edge
-    // return barrier. Pairing stores this complementary placement on purpose.
-    require_peer_placement(
-        &peer,
-        config::RelativePlacement::Right,
-        "client (right-edge return)",
-    )?;
+    let client_placement = horizontal_placement(peer.placement)?;
+    // Pairing stores the complementary direction: client right means host is
+    // on its right, so return through the client's right edge (and vice versa).
+    let return_edge = match client_placement {
+        config::RelativePlacement::Right => protocol::WireEdge::Right,
+        config::RelativePlacement::Left => protocol::WireEdge::Left,
+        config::RelativePlacement::Above | config::RelativePlacement::Below => unreachable!(),
+    };
 
     eprintln!("starting configured RemoteDesktop and right InputCapture sessions; portal consent may be required");
     let mut injector = seamless::RemoteDesktopInjector::start_with_persistence(
@@ -1166,8 +1334,8 @@ fn run_seamless_client_config(
         .take_restore_token()
         .map(|token| token.into_secret());
 
-    let mut return_watcher = match seamless::RightEdgeReturnWatcher::start_with_persistence(
-        -1,
+    let mut return_watcher = match seamless::EdgeReturnWatcher::start_with_persistence(
+        return_edge,
         peer_y,
         portal_persistence(peer.persistent_permissions, peer.capture_restore_token())?,
     ) {
@@ -1199,7 +1367,14 @@ fn run_seamless_client_config(
             config::RestoreTokenUpdates::both(returned_capture, returned_remote),
         )?;
     }
-    run_seamless_client_with_sessions(peer.client_endpoint, *peer.psk(), injector, return_watcher)
+    let topology_changed = spawn_topology_control_listener(path, peer.clone())?;
+    run_seamless_client_with_sessions(
+        peer.client_endpoint,
+        *peer.psk(),
+        injector,
+        return_watcher,
+        Some(topology_changed),
+    )
 }
 
 fn run_seamless_host(
@@ -1227,7 +1402,7 @@ fn run_seamless_host(
     })?;
     eprintln!("starting InputCapture left-edge session; portal consent is required");
     let capture = seamless::InputCaptureAdapter::start_left(local.x)?;
-    run_seamless_host_with_capture(peer, psk, local, remote, capture)
+    run_seamless_host_with_capture(peer, psk, local, remote, handoff::Edge::Left, capture)
 }
 
 fn run_seamless_host_with_capture(
@@ -1235,13 +1410,14 @@ fn run_seamless_host_with_capture(
     psk: [u8; 32],
     local: handoff::Rect,
     remote: handoff::Rect,
+    edge: handoff::Edge,
     capture: seamless::InputCaptureAdapter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connecting seamless host to client at {peer}");
     let stream = connect_seamless_peer(peer, Duration::from_secs(8))?;
     let connection = SecureConnection::connect(stream, Role::Host, &psk)?;
     connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
-    let controller = handoff::HandoffController::new(local, remote, handoff::Edge::Left);
+    let controller = handoff::HandoffController::new(local, remote, edge);
     let mut host = seamless::SeamlessHost::new(controller, capture, connection);
 
     let forward_result: Result<(), Box<dyn std::error::Error>> = (|| loop {
@@ -1250,10 +1426,10 @@ fn run_seamless_host_with_capture(
             while matches!(host.state(), handoff::HandoffState::RemoteActive { .. }) {
                 host.forward_next(Duration::from_millis(HEARTBEAT_INTERVAL_MS))?;
             }
-            eprintln!("peer returned to local host; left barrier remains armed");
+            eprintln!("peer returned to local host; edge barrier remains armed");
             continue;
         }
-        eprintln!("peer rejected entry; left barrier remains armed for another activation");
+        eprintln!("peer rejected entry; edge barrier remains armed for another activation");
     })();
 
     // Cleanup first releases the exact portal activation, then makes a
@@ -1297,14 +1473,30 @@ fn run_seamless_host_config(
     peer_y: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (path, mut bridge_config, peer) = configured_peer(config_override, peer_id)?;
-    // The host owns the left-edge entry barrier for this release.
-    require_peer_placement(
-        &peer,
-        config::RelativePlacement::Left,
-        "host (left-edge entry)",
-    )?;
-    let peer_x = -i32::try_from(peer_width)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "peer width exceeds i32"))?;
+    let placement = horizontal_placement(peer.placement)?;
+    let (peer_x, edge, capture_edge, capture_x) = match placement {
+        config::RelativePlacement::Left => (
+            -i32::try_from(peer_width).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "peer width exceeds i32")
+            })?,
+            handoff::Edge::Left,
+            portal_spike::CaptureEdge::Left,
+            0,
+        ),
+        config::RelativePlacement::Right => (
+            i32::try_from(local_width).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "local width exceeds i32")
+            })?,
+            handoff::Edge::Right,
+            portal_spike::CaptureEdge::Right,
+            i32::try_from(local_width)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "local width exceeds i32")
+                })?
+                .saturating_sub(1),
+        ),
+        config::RelativePlacement::Above | config::RelativePlacement::Below => unreachable!(),
+    };
     let local = handoff::Rect::new(0, 0, local_width, local_height).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1317,9 +1509,10 @@ fn run_seamless_host_config(
             format!("invalid peer layout: {error:?}"),
         )
     })?;
-    eprintln!("starting configured InputCapture left-edge session; portal consent may be required");
-    let mut capture = seamless::InputCaptureAdapter::start_left_with_persistence(
-        local.x,
+    eprintln!("starting configured InputCapture edge session; portal consent may be required");
+    let mut capture = seamless::InputCaptureAdapter::start_with_persistence(
+        capture_edge,
+        capture_x,
         portal_persistence(peer.persistent_permissions, peer.capture_restore_token())?,
     )?;
     if peer.persistent_permissions {
@@ -1334,7 +1527,14 @@ fn run_seamless_host_config(
             ),
         )?;
     }
-    run_seamless_host_with_capture(peer.client_endpoint, *peer.psk(), local, remote, capture)
+    run_seamless_host_with_capture(
+        peer.client_endpoint,
+        *peer.psk(),
+        local,
+        remote,
+        edge,
+        capture,
+    )
 }
 
 fn run_host(

@@ -239,6 +239,18 @@ impl BridgeConfig {
             .ok_or_else(|| ConfigError::PeerNotFound(id.to_owned()))
     }
 
+    /// Changes the stored position for an existing trusted peer.  Callers
+    /// persist the complete config with [`save`] so a topology change is one
+    /// private, atomic rewrite rather than a partially edited file.
+    pub fn set_peer_placement(
+        &mut self,
+        id: &str,
+        placement: RelativePlacement,
+    ) -> Result<(), ConfigError> {
+        self.peer_mut(id)?.placement = placement;
+        self.validate()
+    }
+
     fn peer_mut(&mut self, id: &str) -> Result<&mut PeerConfig, ConfigError> {
         self.peers
             .iter_mut()
