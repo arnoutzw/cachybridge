@@ -494,14 +494,14 @@ public:
         if (status.waitForStarted() && status.waitForFinished(3000)
             && status.exitStatus() == QProcess::NormalExit && status.exitCode() == 0
             && QString::fromUtf8(status.readAllStandardOutput()).contains(
-                QStringLiteral("45231:45232"))) {
+                QStringLiteral("45231:45234"))) {
             return {};
         }
         QProcess rule;
         rule.start(QStringLiteral("pkexec"), {
             ufw, QStringLiteral("allow"), QStringLiteral("from"), subnet,
             QStringLiteral("to"), QStringLiteral("any"), QStringLiteral("port"),
-            QStringLiteral("45231:45232"), QStringLiteral("proto"), QStringLiteral("tcp"),
+            QStringLiteral("45231:45234"), QStringLiteral("proto"), QStringLiteral("tcp"),
         });
         if (!rule.waitForStarted())
             return QStringLiteral("Could not request administrator authorization for the firewall rule.");
@@ -703,7 +703,7 @@ public:
         });
         auto *firewallButton = new QPushButton(QStringLiteral("Allow CachyBridge on this LAN…"));
         firewallButton->setToolTip(QStringLiteral(
-            "Optional one-time administrator action. It saves a persistent UFW rule for CachyBridge's LAN ports."));
+            "Optional one-time administrator action. It saves a persistent UFW rule for CachyBridge input, pairing, and clipboard ports."));
         connect(firewallButton, &QPushButton::clicked, this, [this] {
             const QString error = store_->ensureClientFirewall();
             if (!error.isEmpty()) {
@@ -712,6 +712,51 @@ public:
             }
             QMessageBox::information(this, QStringLiteral("LAN firewall ready"),
                 QStringLiteral("CachyBridge is allowed on this LAN. This rule is persistent; you will not be asked again."));
+        });
+        auto *clipboardSupport = new QPushButton;
+        const auto refreshClipboardSupport = [clipboardSupport] {
+            const bool available = !QStandardPaths::findExecutable(QStringLiteral("wl-copy")).isEmpty()
+                && !QStandardPaths::findExecutable(QStringLiteral("wl-paste")).isEmpty();
+            clipboardSupport->setText(available
+                ? QStringLiteral("Clipboard support installed")
+                : QStringLiteral("Install clipboard support…"));
+            clipboardSupport->setEnabled(!available);
+        };
+        refreshClipboardSupport();
+        clipboardSupport->setToolTip(QStringLiteral(
+            "CachyBridge shares text clipboard contents using wl-clipboard. This is a one-time system install on each iMac."));
+        connect(clipboardSupport, &QPushButton::clicked, this, [this, clipboardSupport, refreshClipboardSupport] {
+            QString pacman = QStandardPaths::findExecutable(QStringLiteral("pacman"));
+            if (pacman.isEmpty() && QFileInfo::exists(QStringLiteral("/usr/bin/pacman")))
+                pacman = QStringLiteral("/usr/bin/pacman");
+            if (pacman.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Could not install clipboard support"),
+                    QStringLiteral("The pacman package manager is not available."));
+                return;
+            }
+            QProcess install;
+            install.start(QStringLiteral("pkexec"), {pacman, QStringLiteral("-S"),
+                QStringLiteral("--needed"), QStringLiteral("--noconfirm"), QStringLiteral("wl-clipboard")});
+            if (!install.waitForStarted()) {
+                QMessageBox::warning(this, QStringLiteral("Could not start installation"),
+                    QStringLiteral("Administrator authorization could not be started."));
+                return;
+            }
+            if (!install.waitForFinished(60000)) {
+                install.kill();
+                QMessageBox::warning(this, QStringLiteral("Clipboard support installation timed out"),
+                    QStringLiteral("Try again and approve the administrator prompt."));
+                return;
+            }
+            if (install.exitStatus() != QProcess::NormalExit || install.exitCode() != 0) {
+                const QString details = QString::fromUtf8(install.readAllStandardError()).trimmed();
+                QMessageBox::warning(this, QStringLiteral("Clipboard support was not installed"),
+                    details.isEmpty() ? QStringLiteral("Administrator authorization was not granted.") : details);
+                return;
+            }
+            refreshClipboardSupport();
+            QMessageBox::information(this, QStringLiteral("Clipboard support ready"),
+                QStringLiteral("Restart the CachyBridge sharing session on both iMacs to begin syncing text."));
         });
         auto *joinButton = new QPushButton(QStringLiteral("Connect host to client with code"));
         connect(joinButton, &QPushButton::clicked, this, [this] {
@@ -773,6 +818,7 @@ public:
             pairingAddress_->setText(selected.left(separator));
         });
         easyLayout->addWidget(firewallButton);
+        easyLayout->addWidget(clipboardSupport);
         easyLayout->addWidget(hostButton);
         hostConnectPanel_ = new QWidget;
         auto *hostConnectLayout = new QVBoxLayout(hostConnectPanel_);

@@ -4,6 +4,7 @@
 //! connects, and encrypted input events are injected on the client. It has no
 //! discovery, clipboard, or edge-handoff logic yet.
 
+mod clipboard;
 pub mod config;
 mod discovery;
 pub mod handoff;
@@ -49,6 +50,7 @@ const DEFAULT_PAIRING_PORT: u16 = 45_232;
 /// the already-authorized pairing port, but pairing and a running client are
 /// mutually exclusive modes, so no second firewall permission is required.
 const DEFAULT_CONTROL_PORT: u16 = DEFAULT_PAIRING_PORT;
+const DEFAULT_CLIPBOARD_PORT: u16 = 45_234;
 const INPUT_QUEUE_CAPACITY: usize = 1_024;
 /// The client must service both its local return barrier and remote input.
 /// One millisecond limits the event-driven EIS injection wait without busy
@@ -1078,6 +1080,51 @@ fn spawn_topology_control_listener(
     Ok(changed_rx)
 }
 
+/// The controlled side owns the clipboard listener just as it owns the input
+/// listener. A failed or closed clipboard connection never affects keyboard
+/// and mouse forwarding; it retries independently in its worker thread.
+fn spawn_clipboard_client(peer: config::PeerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let listen = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CLIPBOARD_PORT);
+    let listener = TcpListener::bind(listen)?;
+    std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, remote)) => {
+                match SecureConnection::connect(stream, Role::Client, peer.psk()) {
+                    Ok(connection) => {
+                        eprintln!("clipboard peer connected from {remote}");
+                        if let Err(error) = clipboard::run(connection) {
+                            eprintln!("clipboard session ended: {error}");
+                        }
+                    }
+                    Err(error) => eprintln!("ignored clipboard connection from {remote}: {error}"),
+                }
+            }
+            Err(error) => {
+                eprintln!("clipboard listener stopped: {error}");
+                return;
+            }
+        }
+    });
+    Ok(())
+}
+
+fn spawn_clipboard_host(peer: config::PeerConfig) {
+    std::thread::spawn(move || loop {
+        let address = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CLIPBOARD_PORT);
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))?;
+            let connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
+            eprintln!("clipboard sync connected to {address}");
+            clipboard::run(connection)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("clipboard sync unavailable: {error}");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_left_edge_demo(
     peer: SocketAddr,
@@ -1367,6 +1414,7 @@ fn run_seamless_client_config(
             config::RestoreTokenUpdates::both(returned_capture, returned_remote),
         )?;
     }
+    spawn_clipboard_client(peer.clone())?;
     let topology_changed = spawn_topology_control_listener(path, peer.clone())?;
     run_seamless_client_with_sessions(
         peer.client_endpoint,
@@ -1527,6 +1575,7 @@ fn run_seamless_host_config(
             ),
         )?;
     }
+    spawn_clipboard_host(peer.clone());
     run_seamless_host_with_capture(
         peer.client_endpoint,
         *peer.psk(),

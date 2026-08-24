@@ -16,7 +16,10 @@ const NOISE_TAG_BYTES: usize = 16;
 /// The input protocol itself remains limited to its small fixed-size frames.
 /// Pairing needs one bounded configuration exchange, so the secure transport
 /// has a deliberately separate, modest application-record limit.
-const MAX_APPLICATION_PAYLOAD: usize = 1024;
+/// Clipboard sync is deliberately capped at a modest text-only record.  This
+/// keeps a malformed peer from allocating unbounded memory while still being
+/// large enough for ordinary URLs, snippets and shell commands.
+pub const MAX_APPLICATION_PAYLOAD: usize = u16::MAX as usize - NOISE_TAG_BYTES;
 const MAX_CIPHERTEXT_FRAME: usize = MAX_APPLICATION_PAYLOAD + NOISE_TAG_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,11 +183,20 @@ impl SecureConnection {
     /// framing progress. We read only after the full length-prefixed record is
     /// present in the kernel socket buffer.
     pub fn poll_receive(&mut self) -> Result<Option<Message>, TransportError> {
+        self.poll_receive_payload()?
+            .map(|plaintext| decode_frame(&plaintext).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Returns one complete already-buffered authenticated application record
+    /// without blocking. Used by clipboard sync, whose own wire format is
+    /// intentionally separate from latency-sensitive input frames.
+    pub fn poll_receive_payload(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
         self.stream.set_nonblocking(true)?;
         let result = (|| {
             let mut header = [0_u8; 2];
             let received = match self.stream.peek(&mut header) {
-                Ok(0) => return self.receive().map(Some),
+                Ok(0) => return self.receive_payload().map(Some),
                 Ok(received) => received,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
                 Err(error) => return Err(TransportError::Io(error)),
@@ -206,7 +218,7 @@ impl SecureConnection {
             if received < total_len {
                 return Ok(None);
             }
-            self.receive().map(Some)
+            self.receive_payload().map(Some)
         })();
         let restore_result = self.stream.set_nonblocking(false);
         match (result, restore_result) {

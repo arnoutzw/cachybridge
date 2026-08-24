@@ -93,6 +93,10 @@ sudo target/release/cachybridge kernel-self-test
   first-entry cursor placement is not yet guaranteed without the planned
   ScreenCast absolute-coordinate mapping.
 - One host and one client.
-- The current config-driven seamless runtime supports a left-side peer; right,
-  above, and below are stored by setup but rejected clearly at runtime.
-- No clipboard, file transfer, or automatic discovery.
+- The config-driven seamless runtime supports left/right peers. Vertical
+  placement is not available yet.
+- Plain-text clipboard is shared bidirectionally over a second Noise-PSK
+  connection while a seamless session is running. It requires the
+  `wl-clipboard` package (`wl-copy` and `wl-paste`) on both desktops, limits
+  a single item to 64 KiB, and deliberately excludes images and files.
+- No file transfer.
