@@ -278,7 +278,12 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
 fn write_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
     validate_content(content)?;
     let mut child = Command::new(clipboard_tool("wl-copy"))
-        .args(["--type", &content.mime_type])
+        // wl-copy normally forks into a clipboard-provider daemon. Waiting for
+        // the initial process can therefore block forever under systemd's
+        // subreaper, which froze our receive loop after its first update. Keep
+        // it in the foreground, return to the sync loop immediately, and reap
+        // that provider asynchronously once a newer clipboard replaces it.
+        .args(["--foreground", "--type", &content.mime_type])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -289,14 +294,19 @@ fn write_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
         .take()
         .ok_or_else(|| ClipboardError::Command("wl-copy did not accept stdin".to_owned()))?
         .write_all(&content.bytes)?;
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(ClipboardError::Command(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ))
-    }
+    // Closing stdin tells wl-copy that it has received the complete item.
+    // Do not wait here: a successful clipboard provider remains alive until
+    // its selection is superseded, which is the expected Wayland behavior.
+    drop(child.stdin.take());
+    thread::spawn(move || match child.wait_with_output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "clipboard provider exited unsuccessfully: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => eprintln!("clipboard provider wait failed: {error}"),
+    });
+    Ok(())
 }
 
 fn validate_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
