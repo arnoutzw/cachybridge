@@ -77,6 +77,18 @@ QString bundledCliPath() {
     return adjacent;
 }
 
+QString clipboardToolPath(const QString &name) {
+    const QString bundled = QCoreApplication::applicationDirPath() + u'/' + name;
+    if (QFileInfo(bundled).isExecutable())
+        return bundled;
+    return QStandardPaths::findExecutable(name);
+}
+
+bool clipboardToolsAvailable() {
+    return !clipboardToolPath(QStringLiteral("wl-copy")).isEmpty()
+        && !clipboardToolPath(QStringLiteral("wl-paste")).isEmpty();
+}
+
 struct SetupDraft {
     QString hostName;
     QString hostEndpoint;
@@ -715,8 +727,7 @@ public:
         });
         auto *clipboardSupport = new QPushButton;
         const auto refreshClipboardSupport = [clipboardSupport] {
-            const bool available = !QStandardPaths::findExecutable(QStringLiteral("wl-copy")).isEmpty()
-                && !QStandardPaths::findExecutable(QStringLiteral("wl-paste")).isEmpty();
+            const bool available = clipboardToolsAvailable();
             clipboardSupport->setText(available
                 ? QStringLiteral("Clipboard support installed")
                 : QStringLiteral("Install clipboard support…"));

@@ -4,6 +4,7 @@
 
 use std::{
     io::{self, Write},
+    path::PathBuf,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -227,7 +228,7 @@ fn decode_chunk(record: &[u8]) -> Result<(u64, usize, &[u8]), ClipboardError> {
 }
 
 fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
-    let types = Command::new("wl-paste")
+    let types = Command::new(clipboard_tool("wl-paste"))
         .arg("--list-types")
         .output()
         .map_err(map_command_start)?;
@@ -241,7 +242,7 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
     else {
         return Ok(None);
     };
-    let output = Command::new("wl-paste")
+    let output = Command::new(clipboard_tool("wl-paste"))
         .args(["--no-newline", "--type", mime_type])
         .output()
         .map_err(map_command_start)?;
@@ -258,7 +259,7 @@ fn read_content() -> Result<Option<ClipboardContent>, ClipboardError> {
 
 fn write_content(content: &ClipboardContent) -> Result<(), ClipboardError> {
     validate_content(content)?;
-    let mut child = Command::new("wl-copy")
+    let mut child = Command::new(clipboard_tool("wl-copy"))
         .args(["--type", &content.mime_type])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -305,6 +306,19 @@ fn map_command_start(error: io::Error) -> ClipboardError {
     } else {
         ClipboardError::Io(error)
     }
+}
+
+/// A portable CachyBridge deployment can place the tiny wl-clipboard helpers
+/// next to its CLI. Prefer those when present, then fall back to the system
+/// package for normal distro installations.
+fn clipboard_tool(name: &str) -> PathBuf {
+    if let Ok(executable) = std::env::current_exe() {
+        let bundled = executable.with_file_name(name);
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
