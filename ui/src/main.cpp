@@ -164,6 +164,28 @@ QString detectedLanCidr() {
     return {};
 }
 
+QString firewallPermissionMarkerPath() {
+    const QString directory = QStandardPaths::writableLocation(
+        QStandardPaths::AppLocalDataLocation);
+    return directory.isEmpty() ? QString() : directory + QStringLiteral("/firewall-v2-ready");
+}
+
+bool firewallPermissionConfigured() {
+    const QString marker = firewallPermissionMarkerPath();
+    return !marker.isEmpty() && QFileInfo::exists(marker);
+}
+
+bool rememberFirewallPermission() {
+    const QString marker = firewallPermissionMarkerPath();
+    if (marker.isEmpty() || !QDir().mkpath(QFileInfo(marker).absolutePath()))
+        return false;
+    QSaveFile file(marker);
+    if (!file.open(QIODevice::WriteOnly) || file.write("ports=45231:45234\n") < 0)
+        return false;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return file.commit();
+}
+
 class DraggableClientTile final : public QGraphicsRectItem {
 public:
     explicit DraggableClientTile(const QRectF &rect, std::function<void(QPointF)> released)
@@ -490,6 +512,7 @@ public:
     }
 
     QString ensureClientFirewall() override {
+        if (firewallPermissionConfigured()) return {};
         QString ufw = QStandardPaths::findExecutable(QStringLiteral("ufw"));
         if (ufw.isEmpty() && QFileInfo::exists(QStringLiteral("/usr/bin/ufw")))
             ufw = QStringLiteral("/usr/bin/ufw");
@@ -499,16 +522,6 @@ public:
         const QString subnet = detectedLanCidr();
         if (subnet.isEmpty())
             return QStringLiteral("Could not determine this iMac's local IPv4 subnet for the firewall rule.");
-        // UFW rules persist. Avoid unnecessarily invoking pkexec after this
-        // client has already been authorized once.
-        QProcess status;
-        status.start(ufw, {QStringLiteral("status")});
-        if (status.waitForStarted() && status.waitForFinished(3000)
-            && status.exitStatus() == QProcess::NormalExit && status.exitCode() == 0
-            && QString::fromUtf8(status.readAllStandardOutput()).contains(
-                QStringLiteral("45231:45234"))) {
-            return {};
-        }
         QProcess rule;
         rule.start(QStringLiteral("pkexec"), {
             ufw, QStringLiteral("allow"), QStringLiteral("from"), subnet,
@@ -526,6 +539,8 @@ public:
             return details.isEmpty()
                 ? QStringLiteral("Firewall access was not granted.") : details;
         }
+        if (!rememberFirewallPermission())
+            return QStringLiteral("Firewall rule was added, but CachyBridge could not remember the approval state.");
         return {};
     }
 
@@ -716,12 +731,18 @@ public:
         auto *firewallButton = new QPushButton(QStringLiteral("Allow CachyBridge on this LAN…"));
         firewallButton->setToolTip(QStringLiteral(
             "Optional one-time administrator action. It saves a persistent UFW rule for CachyBridge input, pairing, and clipboard ports."));
-        connect(firewallButton, &QPushButton::clicked, this, [this] {
+        if (firewallPermissionConfigured()) {
+            firewallButton->setText(QStringLiteral("CachyBridge LAN access configured"));
+            firewallButton->setEnabled(false);
+        }
+        connect(firewallButton, &QPushButton::clicked, this, [this, firewallButton] {
             const QString error = store_->ensureClientFirewall();
             if (!error.isEmpty()) {
                 QMessageBox::warning(this, QStringLiteral("Could not update firewall"), error);
                 return;
             }
+            firewallButton->setText(QStringLiteral("CachyBridge LAN access configured"));
+            firewallButton->setEnabled(false);
             QMessageBox::information(this, QStringLiteral("LAN firewall ready"),
                 QStringLiteral("CachyBridge is allowed on this LAN. This rule is persistent; you will not be asked again."));
         });
