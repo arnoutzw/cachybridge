@@ -16,9 +16,16 @@ An end-to-end run without physical input devices uses `client --dry-run` and `ho
 
 ## Native v4 setup wizard
 
-The Qt 6 Widgets wizard configures the local/peer names, host and client IP
-endpoints, pairing PSK, persistent portal-permission preference, and the
-client's position to the left, right, above, or below the host.
+The Qt 6 Widgets wizard offers the normal **Easy one-time pairing** flow:
+
+1. On the input-owner iMac, choose **Show one-time pairing code** and select
+   the client placement.
+2. On the other iMac, choose **Join with a one-time code**, entering the host
+   LAN address and displayed code.
+3. Both machines save the new peer automatically; the code expires after five
+   minutes and works for one successful join only.
+
+The wizard also retains the manual PSK form for recovery and advanced setups.
 
 ```bash
 cargo build --release --offline
@@ -31,13 +38,29 @@ For an installed build, place `cachybridge` and `cachybridge-setup` in the same
 binary directory and run `cachybridge setup`. Use `--config PATH` to work with
 a non-default v4 configuration file.
 
-The wizard delegates validation and saving to `cachybridge peer-add`. Pairing
-tokens are passed through owner-only temporary files, never process arguments.
-Its **Generate token** button delegates to the Rust OS-random generator. The
+One-time codes carry 128 bits of OS-random entropy in grouped Base32. They
+authenticate a temporary encrypted pairing connection, which transfers a
+fresh 256-bit long-term key; the displayed code is never saved. The manual
+PSK path delegates validation and saving to `cachybridge peer-add`; its tokens
+are passed through owner-only temporary files, never process arguments. The
 persistent-permissions setting is stored per peer in the private v4 config;
 the first configured seamless start requests consent and subsequent starts use
 the portal’s one-time restore tokens. Setup itself never opens a desktop portal
 or requests consent.
+
+The same workflow is available to installers and automation without a GUI:
+
+```bash
+# Input-owner iMac: show the generated code, then wait for one join.
+cachybridge pair-code
+cachybridge pair-host --code "$PAIR_CODE" --placement left
+
+# Other iMac: enter that code and the host address shown by setup.
+cachybridge pair-join --connect 192.168.2.226:45232 \
+  --code "$PAIR_CODE" --local-name "Left iMac"
+```
+
+`$PAIR_CODE` denotes the code printed by `cachybridge pair-code`.
 
 The configuration directory is mode 0700 and its `config.v4` file is mode
 0600. `seamless-host-config` and `seamless-client-config` load peer endpoints,

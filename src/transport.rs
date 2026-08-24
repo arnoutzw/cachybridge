@@ -6,12 +6,16 @@ use std::net::TcpStream;
 use snow::{params::NoiseParams, Builder, TransportState};
 use thiserror::Error;
 
-use crate::protocol::{decode_frame, encode_frame, Message, ProtocolError, MAX_PLAINTEXT_FRAME};
+use crate::protocol::{decode_frame, encode_frame, Message, ProtocolError};
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAX_HANDSHAKE_PACKET: usize = 1024;
 const NOISE_TAG_BYTES: usize = 16;
-const MAX_CIPHERTEXT_FRAME: usize = MAX_PLAINTEXT_FRAME + NOISE_TAG_BYTES;
+/// The input protocol itself remains limited to its small fixed-size frames.
+/// Pairing needs one bounded configuration exchange, so the secure transport
+/// has a deliberately separate, modest application-record limit.
+const MAX_APPLICATION_PAYLOAD: usize = 1024;
+const MAX_CIPHERTEXT_FRAME: usize = MAX_APPLICATION_PAYLOAD + NOISE_TAG_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -86,20 +90,36 @@ impl SecureConnection {
 
     pub fn send(&mut self, message: Message) -> Result<(), TransportError> {
         let plaintext = encode_frame(message);
-        let mut encrypted = [0_u8; MAX_CIPHERTEXT_FRAME];
-        let len = self.noise.write_message(&plaintext, &mut encrypted)?;
-        write_record(&mut self.stream, &encrypted[..len], MAX_CIPHERTEXT_FRAME)
+        self.send_payload(&plaintext)
     }
 
     pub fn receive(&mut self) -> Result<Message, TransportError> {
+        let plaintext = self.receive_payload()?;
+        decode_frame(&plaintext).map_err(Into::into)
+    }
+
+    /// Sends a bounded authenticated application record.  This is reserved for
+    /// setup-time exchanges; the live input path uses [`Self::send`] so its
+    /// stricter protocol limit stays intact.
+    pub fn send_payload(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        if plaintext.len() > MAX_APPLICATION_PAYLOAD {
+            return Err(TransportError::RecordTooLarge(plaintext.len()));
+        }
+        let mut encrypted = [0_u8; MAX_CIPHERTEXT_FRAME];
+        let len = self.noise.write_message(plaintext, &mut encrypted)?;
+        write_record(&mut self.stream, &encrypted[..len], MAX_CIPHERTEXT_FRAME)
+    }
+
+    /// Receives one bounded authenticated application record.
+    pub fn receive_payload(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut encrypted = [0_u8; MAX_CIPHERTEXT_FRAME];
         let len = read_record(&mut self.stream, &mut encrypted, MAX_CIPHERTEXT_FRAME)?;
         if len < NOISE_TAG_BYTES {
             return Err(TransportError::InvalidNoisePacket);
         }
-        let mut plaintext = [0_u8; MAX_PLAINTEXT_FRAME];
+        let mut plaintext = [0_u8; MAX_APPLICATION_PAYLOAD];
         let len = self.noise.read_message(&encrypted[..len], &mut plaintext)?;
-        decode_frame(&plaintext[..len]).map_err(Into::into)
+        Ok(plaintext[..len].to_vec())
     }
 
     /// Returns one complete already-buffered encrypted record without blocking.
@@ -266,7 +286,7 @@ mod tests {
         let mut encrypted = [0_u8; MAX_CIPHERTEXT_FRAME];
         let encrypted_len = sender.write_message(&plaintext, &mut encrypted).unwrap();
         assert_ne!(&encrypted[..encrypted_len], plaintext.as_slice());
-        let mut decoded = [0_u8; MAX_PLAINTEXT_FRAME];
+        let mut decoded = [0_u8; MAX_APPLICATION_PAYLOAD];
         let decoded_len = receiver
             .read_message(&encrypted[..encrypted_len], &mut decoded)
             .unwrap();

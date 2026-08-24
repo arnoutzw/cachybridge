@@ -47,10 +47,21 @@ struct SetupDraft {
     bool persistentPermissions = false;
 };
 
+struct PairJoinDraft {
+    QString localName;
+    QString hostAddress;
+    QString code;
+    bool persistentPermissions = false;
+};
+
 class SetupStore {
 public:
     virtual ~SetupStore() = default;
     virtual QString generatePairingToken(QString *error) = 0;
+    virtual QString generatePairingCode(QString *error) = 0;
+    virtual QString startPairHost(const SetupDraft &draft, const QString &code,
+                                  QProcess *process) = 0;
+    virtual QString joinPairHost(const PairJoinDraft &draft) = 0;
     virtual QString save(const SetupDraft &draft) = 0;
 };
 
@@ -88,6 +99,66 @@ public:
             return {};
         }
         return token;
+    }
+
+    QString generatePairingCode(QString *error) override {
+        QProcess process;
+        process.start(cachybridge_, {QStringLiteral("pair-code")});
+        if (!process.waitForStarted() || !process.waitForFinished(15000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            *error = details.isEmpty()
+                ? QStringLiteral("The one-time-code generator failed.") : details;
+            return {};
+        }
+        const QString code = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        if (code.size() != 31) {
+            *error = QStringLiteral("The code generator returned an unexpected value.");
+            return {};
+        }
+        return code;
+    }
+
+    QString startPairHost(const SetupDraft &draft, const QString &code,
+                          QProcess *process) override {
+        QStringList arguments{
+            QStringLiteral("pair-host"), QStringLiteral("--listen"),
+            QStringLiteral("0.0.0.0:45232"), QStringLiteral("--code"), code,
+            QStringLiteral("--local-name"), draft.hostName,
+            QStringLiteral("--placement"), placementName(draft.placement),
+        };
+        if (!configPath_.isEmpty())
+            arguments << QStringLiteral("--config") << configPath_;
+        if (draft.persistentPermissions)
+            arguments << QStringLiteral("--persistent-permissions");
+        process->start(cachybridge_, arguments);
+        if (!process->waitForStarted())
+            return QStringLiteral("Could not start %1: %2").arg(cachybridge_, process->errorString());
+        return {};
+    }
+
+    QString joinPairHost(const PairJoinDraft &draft) override {
+        QProcess process;
+        QStringList arguments{
+            QStringLiteral("pair-join"), QStringLiteral("--connect"), draft.hostAddress,
+            QStringLiteral("--code"), draft.code, QStringLiteral("--local-name"), draft.localName,
+        };
+        if (!configPath_.isEmpty())
+            arguments << QStringLiteral("--config") << configPath_;
+        if (draft.persistentPermissions)
+            arguments << QStringLiteral("--persistent-permissions");
+        process.start(cachybridge_, arguments);
+        if (!process.waitForStarted())
+            return QStringLiteral("Could not start %1: %2").arg(cachybridge_, process.errorString());
+        if (!process.waitForFinished(15000)) {
+            process.kill();
+            return QStringLiteral("Pairing timed out. Check the host address and the displayed code.");
+        }
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const auto details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            return details.isEmpty() ? QStringLiteral("Pairing was rejected or expired.") : details;
+        }
+        return {};
     }
 
     QString save(const SetupDraft &draft) override {
@@ -148,8 +219,8 @@ public:
         heading->setFont(headingFont);
 
         auto *intro = new QLabel(QStringLiteral(
-            "Choose where the client display sits relative to this host. "
-            "No input portal is opened by this setup window."));
+            "Pair with a one-time code, then choose where the client display sits relative "
+            "to this host. No input portal is opened by this setup window."));
         intro->setWordWrap(true);
 
         hostName_ = new QLineEdit(QSysInfo::machineHostName());
@@ -160,6 +231,12 @@ public:
         pairingPsk_->setEchoMode(QLineEdit::Password);
         pairingPsk_->setMaxLength(64);
         pairingPsk_->setPlaceholderText(QStringLiteral("64 hexadecimal characters"));
+
+        pairingCode_ = new QLineEdit;
+        pairingCode_->setPlaceholderText(QStringLiteral("ABCDE-FGHJK-MNPQR-STUVW-XYZ23-4"));
+        pairingCode_->setMaxLength(31);
+        pairingAddress_ = new QLineEdit;
+        pairingAddress_->setPlaceholderText(QStringLiteral("Host address, e.g. 192.168.2.226:45232"));
 
         auto *generateSecret = new QPushButton(QStringLiteral("Generate token"));
         connect(generateSecret, &QPushButton::clicked, this, [this] {
@@ -189,6 +266,78 @@ public:
         tokenRow->addWidget(showSecret);
         form->addRow(QStringLiteral("Pairing PSK / token"), tokenRow);
 
+        auto *easyPairing = new QGroupBox(QStringLiteral("Easy one-time pairing (recommended)"));
+        auto *easyLayout = new QVBoxLayout(easyPairing);
+        auto *hostButton = new QPushButton(QStringLiteral("Show one-time pairing code on this iMac"));
+        hostButton->setToolTip(QStringLiteral(
+            "Starts a five-minute listener. On the other iMac, enter this iMac's LAN address and the displayed code."));
+        connect(hostButton, &QPushButton::clicked, this, [this, hostButton] {
+            if (hostPairingProcess_) {
+                QMessageBox::information(this, QStringLiteral("Pairing is already open"),
+                    QStringLiteral("This iMac is already waiting for one device to join."));
+                return;
+            }
+            QString error;
+            const QString code = store_->generatePairingCode(&error);
+            if (!error.isEmpty()) {
+                QMessageBox::critical(this, QStringLiteral("Could not create code"), error);
+                return;
+            }
+            SetupDraft draft{hostName_->text().trimmed(), hostEndpoint_->text().trimmed(),
+                clientName_->text().trimmed(), clientEndpoint_->text().trimmed(), QString(),
+                selectedPlacement(), persistent_->isChecked()};
+            hostPairingProcess_ = new QProcess(this);
+            const QString startError = store_->startPairHost(draft, code, hostPairingProcess_);
+            if (!startError.isEmpty()) {
+                hostPairingProcess_->deleteLater();
+                hostPairingProcess_ = nullptr;
+                QMessageBox::critical(this, QStringLiteral("Could not start pairing"), startError);
+                return;
+            }
+            const QString address = localLanAddress();
+            hostButton->setEnabled(false);
+            QMessageBox::information(this, QStringLiteral("Pairing code — valid for five minutes"),
+                QStringLiteral("On the other iMac, choose ‘Join with a one-time code’ and enter:\n\n"
+                    "Host address: %1:45232\nCode: %2\n\nThis code works once and is not saved.")
+                    .arg(address, code));
+            connect(hostPairingProcess_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+                [this, hostButton](int exitCode, QProcess::ExitStatus status) {
+                    const QString details = QString::fromUtf8(hostPairingProcess_->readAllStandardError()).trimmed();
+                    hostPairingProcess_->deleteLater();
+                    hostPairingProcess_ = nullptr;
+                    hostButton->setEnabled(true);
+                    if (status == QProcess::NormalExit && exitCode == 0)
+                        QMessageBox::information(this, QStringLiteral("Pairing complete"),
+                            QStringLiteral("The new peer was saved on this iMac with private permissions."));
+                    else
+                        QMessageBox::warning(this, QStringLiteral("Pairing ended"),
+                            details.isEmpty() ? QStringLiteral("The code expired or pairing was not completed.") : details);
+                });
+        });
+        auto *joinButton = new QPushButton(QStringLiteral("Join with a one-time code"));
+        connect(joinButton, &QPushButton::clicked, this, [this] {
+            const PairJoinDraft draft{hostName_->text().trimmed(), pairingAddress_->text().trimmed(),
+                pairingCode_->text().trimmed(), persistent_->isChecked()};
+            if (draft.localName.isEmpty() || draft.hostAddress.isEmpty() || draft.code.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Pairing details needed"),
+                    QStringLiteral("Enter this iMac's name, the host address, and its displayed code."));
+                return;
+            }
+            const QString error = store_->joinPairHost(draft);
+            if (!error.isEmpty()) {
+                QMessageBox::warning(this, QStringLiteral("Could not join"), error);
+                return;
+            }
+            QMessageBox::information(this, QStringLiteral("Pairing complete"),
+                QStringLiteral("The host was saved on this iMac with private permissions."));
+        });
+        auto *joinForm = new QFormLayout;
+        joinForm->addRow(QStringLiteral("Host address"), pairingAddress_);
+        joinForm->addRow(QStringLiteral("One-time code"), pairingCode_);
+        easyLayout->addWidget(hostButton);
+        easyLayout->addLayout(joinForm);
+        easyLayout->addWidget(joinButton);
+
         auto *placementBox = new QGroupBox(QStringLiteral("Client placement"));
         auto *placementGrid = new QGridLayout(placementBox);
         placementGroup_ = new QButtonGroup(this);
@@ -210,7 +359,7 @@ public:
         persistent_->setToolTip(QStringLiteral(
             "Stores portal-issued single-use restore tokens in the private CachyBridge configuration."));
 
-        auto *saveButton = new QPushButton(QStringLiteral("Save pairing"));
+        auto *saveButton = new QPushButton(QStringLiteral("Save manual pairing"));
         saveButton->setDefault(true);
         auto *cancel = new QPushButton(QStringLiteral("Cancel"));
         connect(cancel, &QPushButton::clicked, this, &QWidget::close);
@@ -224,6 +373,7 @@ public:
         layout->addWidget(heading);
         layout->addWidget(intro);
         layout->addSpacing(8);
+        layout->addWidget(easyPairing);
         layout->addLayout(form);
         layout->addWidget(placementBox);
         layout->addWidget(persistent_);
@@ -231,6 +381,31 @@ public:
     }
 
 private:
+    Placement selectedPlacement() const {
+        const auto *button = placementGroup_->checkedButton();
+        if (!button) return Placement::Left;
+        const auto placement = button->property("placement").toString();
+        if (placement == QStringLiteral("right")) return Placement::Right;
+        if (placement == QStringLiteral("above")) return Placement::Above;
+        if (placement == QStringLiteral("below")) return Placement::Below;
+        return Placement::Left;
+    }
+
+    static QString localLanAddress() {
+        QProcess process;
+        process.start(QStringLiteral("hostname"), {QStringLiteral("-I")});
+        if (process.waitForStarted() && process.waitForFinished(1000)
+            && process.exitStatus() == QProcess::NormalExit && process.exitCode() == 0) {
+            const QStringList addresses = QString::fromUtf8(process.readAllStandardOutput())
+                .simplified().split(u' ', Qt::SkipEmptyParts);
+            for (const QString &address : addresses) {
+                if (!address.startsWith(QStringLiteral("127.")))
+                    return address;
+            }
+        }
+        return QStringLiteral("<this iMac's LAN IP>");
+    }
+
     void addPlacementButton(QGridLayout *layout, const QString &label, Placement placement,
                             int row, int column, bool checked = false) {
         auto *button = new QPushButton(label);
@@ -301,8 +476,11 @@ private:
     QLineEdit *clientName_ = nullptr;
     QLineEdit *clientEndpoint_ = nullptr;
     QLineEdit *pairingPsk_ = nullptr;
+    QLineEdit *pairingCode_ = nullptr;
+    QLineEdit *pairingAddress_ = nullptr;
     QButtonGroup *placementGroup_ = nullptr;
     QCheckBox *persistent_ = nullptr;
+    QProcess *hostPairingProcess_ = nullptr;
 };
 
 } // namespace

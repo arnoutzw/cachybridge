@@ -2,6 +2,7 @@
 /target/
 /work/
 /outputs/
+/build/
 
 # Pairing and portal credentials must never enter version control.
 *.psk

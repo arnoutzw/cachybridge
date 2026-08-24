@@ -8,7 +8,6 @@ use thiserror::Error;
 /// Older handoff implementations fail closed during decoding.
 pub const PROTOCOL_VERSION: u8 = 4;
 pub const MAX_FRAME_PAYLOAD: usize = 64;
-pub const MAX_PLAINTEXT_FRAME: usize = 4 + MAX_FRAME_PAYLOAD;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub const PEER_TIMEOUT_MS: u64 = 5_000;
 
