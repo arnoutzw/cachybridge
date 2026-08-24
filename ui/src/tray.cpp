@@ -108,6 +108,10 @@ public:
         });
         menu->addSeparator();
         menu->addAction(QStringLiteral("Quit CachyBridge"), this, [this] {
+            // The sharing service deliberately outlives ordinary setup-window
+            // closes so the tray can keep a session alive. Tray Quit is the
+            // explicit exception: stop either configured role before exiting.
+            stopSharing();
             // The setup window may have been opened from the Start Menu, not
             // by this tray process. Use the local control socket so Quit is a
             // single, predictable action in either case.
@@ -135,6 +139,17 @@ public:
     }
 
 private:
+    void stopSharing() const {
+        const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
+        if (systemctl.isEmpty())
+            return;
+        // Only one role is normally active, but stopping both makes Quit
+        // reliable after a role change or an interrupted re-pair.
+        QProcess::execute(systemctl, {QStringLiteral("--user"), QStringLiteral("stop"),
+            QStringLiteral("cachybridge-seamless-host"),
+            QStringLiteral("cachybridge-seamless-client")});
+    }
+
     void openSetup() {
         if (sendSetupCommand("activate"))
             return;
