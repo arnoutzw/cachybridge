@@ -25,6 +25,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
+#include <QSettings>
 #include <QSpinBox>
 #include <QSysInfo>
 #include <QStandardPaths>
@@ -1095,16 +1096,26 @@ public:
             "Each channel is checked every second. A green state means this iMac has an established, "
             "authenticated CachyBridge transport socket; it is more useful than only knowing that the service started."));
         diagnosticsHint->setWordWrap(true);
-        auto *kvmStatus = new QLabel;
-        auto *clipboardStatus = new QLabel;
         diagnosticsLayout->addWidget(diagnosticsHeading);
         diagnosticsLayout->addWidget(diagnosticsHint);
         diagnosticsLayout->addSpacing(8);
-        diagnosticsLayout->addWidget(kvmStatus);
-        diagnosticsLayout->addWidget(clipboardStatus);
+        diagnosticsLayout->addWidget(new QLabel(QStringLiteral(
+            "The current KVM and clipboard channel state is always visible in the status bar below.")));
         diagnosticsLayout->addStretch();
         tabs->addTab(connectionDiagnostics, QStringLiteral("Connections"));
         layout->addWidget(tabs, 1);
+
+        auto *statusBar = new QWidget;
+        statusBar->setStyleSheet(QStringLiteral(
+            "QWidget { background: palette(alternate-base); border-radius: 6px; } "
+            "QLabel { padding: 6px 10px; }"));
+        auto *statusLayout = new QHBoxLayout(statusBar);
+        statusLayout->setContentsMargins(4, 2, 4, 2);
+        auto *kvmStatus = new QLabel;
+        auto *clipboardStatus = new QLabel;
+        statusLayout->addWidget(kvmStatus, 1);
+        statusLayout->addWidget(clipboardStatus, 1);
+        layout->addWidget(statusBar);
 
         auto *kvmHeartbeat = new ConnectionHeartbeatMonitor(
             kvmStatus, QStringLiteral("KVM input (TCP 45231)"), 45231, this);
@@ -1171,6 +1182,7 @@ private:
 
     QString startClientSession(const QString &peerId) const {
         const QSize size = logicalScreenSize();
+        rememberStartupSession(peerId, MachineRole::Client, size);
         return startUserService(QStringLiteral("cachybridge-seamless-client"), {
             QStringLiteral("seamless-client-config"), QStringLiteral("--peer"), peerId,
             QStringLiteral("--peer-width"), QString::number(size.width()),
@@ -1181,6 +1193,7 @@ private:
     QString startHostSession(const QString &peerId) const {
         const QSize local = logicalScreenSize();
         const QSize remote(clientWidth_->value(), clientHeight_->value());
+        rememberStartupSession(peerId, MachineRole::Host, remote);
         return startUserService(QStringLiteral("cachybridge-seamless-host"), {
             QStringLiteral("seamless-host-config"), QStringLiteral("--peer"), peerId,
             QStringLiteral("--local-width"), QString::number(local.width()),
@@ -1189,6 +1202,17 @@ private:
             QStringLiteral("--peer-height"), QString::number(remote.height()),
             QStringLiteral("--peer-y"), QStringLiteral("0"),
         });
+    }
+
+    void rememberStartupSession(const QString &peerId, MachineRole role,
+                                const QSize &peerResolution) const {
+        QSettings settings;
+        settings.setValue(QStringLiteral("startup/peer-id"), peerId);
+        settings.setValue(QStringLiteral("startup/role"),
+            role == MachineRole::Host ? QStringLiteral("host") : QStringLiteral("client"));
+        settings.setValue(QStringLiteral("startup/peer-width"), peerResolution.width());
+        settings.setValue(QStringLiteral("startup/peer-height"), peerResolution.height());
+        settings.sync();
     }
 
     Placement selectedPlacement() const {
