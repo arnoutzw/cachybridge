@@ -18,6 +18,8 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QMessageBox>
 #include <QProcess>
 #include <QPushButton>
@@ -39,6 +41,20 @@
 #include <memory>
 
 namespace {
+
+QString setupControlServerName() {
+    return QStringLiteral("cachybridge-setup-control-%1")
+        .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
+}
+
+bool sendSetupCommand(const QByteArray &command) {
+    QLocalSocket socket;
+    socket.connectToServer(setupControlServerName());
+    if (!socket.waitForConnected(300))
+        return false;
+    socket.write(command);
+    return socket.waitForBytesWritten(300);
+}
 
 enum class Placement { Left, Right, Above, Below };
 enum class MachineRole { Host, Client };
@@ -1175,11 +1191,46 @@ int main(int argc, char **argv) {
     parser.addOption(configOption);
     parser.process(application);
 
+    // The Start Menu launches this GUI directly. If it is already open, bring
+    // that one forward instead of creating an ambiguous second setup window.
+    QLocalServer controlServer;
+    const QString controlName = setupControlServerName();
+    if (!controlServer.listen(controlName)) {
+        if (sendSetupCommand("activate"))
+            return 0;
+        QLocalServer::removeServer(controlName);
+        if (!controlServer.listen(controlName)) {
+            QMessageBox::critical(nullptr, QStringLiteral("Could not open CachyBridge"),
+                QStringLiteral("The CachyBridge setup window control channel is unavailable."));
+            return 1;
+        }
+    }
+
     RoleSelectionDialog roleDialog;
     if (roleDialog.exec() != QDialog::Accepted)
         return 0;
     SetupWindow window(std::make_unique<CliSetupStore>(
         parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
+    QObject::connect(&controlServer, &QLocalServer::newConnection, &window, [&] {
+        while (QLocalSocket *socket = controlServer.nextPendingConnection()) {
+            const auto handle = [&application, &window, socket] {
+                const QByteArray command = socket->readAll().trimmed();
+                if (command == "activate") {
+                    window.showNormal();
+                    window.raise();
+                    window.activateWindow();
+                } else if (command == "quit") {
+                    window.close();
+                    application.quit();
+                }
+                socket->disconnectFromServer();
+                socket->deleteLater();
+            };
+            QObject::connect(socket, &QLocalSocket::readyRead, &window, handle);
+            if (socket->bytesAvailable() > 0)
+                handle();
+        }
+    });
     window.show();
     return application.exec();
 }

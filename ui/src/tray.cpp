@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QLocalSocket>
 #include <QMenu>
 #include <QProcess>
 #include <QStandardPaths>
@@ -8,6 +9,20 @@
 #include <KStatusNotifierItem>
 
 namespace {
+
+QString setupControlServerName() {
+    return QStringLiteral("cachybridge-setup-control-%1")
+        .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
+}
+
+bool sendSetupCommand(const QByteArray &command) {
+    QLocalSocket socket;
+    socket.connectToServer(setupControlServerName());
+    if (!socket.waitForConnected(300))
+        return false;
+    socket.write(command);
+    return socket.waitForBytesWritten(300);
+}
 
 class CachyBridgeTray final : public QObject {
 public:
@@ -24,8 +39,13 @@ public:
         menu->addAction(QStringLiteral("Open CachyBridge setup"), this,
             [this] { openSetup(); });
         menu->addSeparator();
-        menu->addAction(QStringLiteral("Quit CachyBridge"), &application_,
-            &QCoreApplication::quit);
+        menu->addAction(QStringLiteral("Quit CachyBridge"), this, [this] {
+            // The setup window may have been opened from the Start Menu, not
+            // by this tray process. Use the local control socket so Quit is a
+            // single, predictable action in either case.
+            sendSetupCommand("quit");
+            application_.quit();
+        });
         item_.setContextMenu(menu);
 
         connect(&item_, &KStatusNotifierItem::activateRequested, this,
@@ -44,6 +64,8 @@ public:
 
 private:
     void openSetup() {
+        if (sendSetupCommand("activate"))
+            return;
         const QString adjacent = QCoreApplication::applicationDirPath()
             + QStringLiteral("/cachybridge-setup");
         const QString program = QFileInfo(adjacent).isExecutable()
