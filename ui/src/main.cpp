@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace {
 
@@ -348,6 +349,31 @@ public:
 private:
     MachineRole role_ = MachineRole::Host;
 };
+
+std::optional<MachineRole> configuredRole(const QString &cachybridge) {
+    QProcess process;
+    process.start(cachybridge, {QStringLiteral("peer-list")});
+    if (!process.waitForStarted() || !process.waitForFinished(3000)
+        || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        return std::nullopt;
+    }
+    const QString line = QString::fromUtf8(process.readAllStandardOutput())
+        .split(u'\n', Qt::SkipEmptyParts).value(0);
+    if (line.isEmpty())
+        return std::nullopt;
+
+    QSettings settings;
+    const QString saved = settings.value(QStringLiteral("startup/role")).toString();
+    if (saved == QStringLiteral("host")) return MachineRole::Host;
+    if (saved == QStringLiteral("client")) return MachineRole::Client;
+
+    // v4 stores the peer relative to this machine. Existing installations did
+    // not record an explicit role; retain the standard left-host/right-client
+    // arrangement without showing setup again. A later session start records
+    // the explicit role for all future launches.
+    return line.section(u'\t', 2, 2) == QStringLiteral("right")
+        ? MachineRole::Client : MachineRole::Host;
+}
 
 class SetupStore {
 public:
@@ -1342,6 +1368,7 @@ int main(int argc, char **argv) {
     }
 
     RoleSelectionDialog roleDialog;
+    const std::optional<MachineRole> existingRole = configuredRole(parser.value(bridgeOption));
     QWidget *activeSetupWindow = nullptr;
     QObject::connect(&controlServer, &QLocalServer::newConnection, &application, [&] {
         while (QLocalSocket *socket = controlServer.nextPendingConnection()) {
@@ -1367,16 +1394,20 @@ int main(int argc, char **argv) {
                 handle();
         }
     });
-    if (roleDialog.exec() != QDialog::Accepted)
+    const MachineRole role = existingRole.has_value() ? *existingRole : [&roleDialog] {
+        return roleDialog.exec() == QDialog::Accepted
+            ? std::optional<MachineRole>(roleDialog.role()) : std::nullopt;
+    }().value_or(MachineRole::Host);
+    if (!existingRole.has_value() && roleDialog.result() != QDialog::Accepted)
         return 0;
     {
         QSettings settings;
         settings.setValue(QStringLiteral("startup/role"),
-            roleDialog.role() == MachineRole::Host ? QStringLiteral("host") : QStringLiteral("client"));
+            role == MachineRole::Host ? QStringLiteral("host") : QStringLiteral("client"));
         settings.sync();
     }
     SetupWindow window(std::make_unique<CliSetupStore>(
-        parser.value(bridgeOption), parser.value(configOption)), roleDialog.role());
+        parser.value(bridgeOption), parser.value(configOption)), role);
     activeSetupWindow = &window;
     window.show();
     return application.exec();
