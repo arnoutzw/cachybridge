@@ -113,6 +113,16 @@ impl RemoteDesktopSession {
             .inject_scroll(horizontal, vertical, finish)
     }
 
+    pub fn inject_scroll_discrete(
+        &mut self,
+        horizontal: i32,
+        vertical: i32,
+        finish: bool,
+    ) -> io::Result<()> {
+        self.sender_mut()?
+            .inject_scroll_discrete(horizontal, vertical, finish)
+    }
+
     pub fn bounded_pointer_test(&mut self) -> io::Result<()> {
         self.sender_mut()?.bounded_pointer_test()
     }

@@ -103,6 +103,7 @@ unsafe extern "C" {
     fn ei_device_pointer_motion(device: *mut EiDevice, x: f64, y: f64);
     fn ei_device_button_button(device: *mut EiDevice, button: u32, is_press: bool);
     fn ei_device_scroll_delta(device: *mut EiDevice, x: f64, y: f64);
+    fn ei_device_scroll_discrete(device: *mut EiDevice, x: i32, y: i32);
     fn ei_device_scroll_stop(device: *mut EiDevice, stop_x: bool, stop_y: bool);
     fn ei_device_keyboard_key(device: *mut EiDevice, keycode: u32, is_press: bool);
 
@@ -278,6 +279,28 @@ impl Sender {
             ei_device_scroll_delta(device.as_ptr(), horizontal, vertical);
             if finish {
                 ei_device_scroll_stop(device.as_ptr(), horizontal != 0.0, vertical != 0.0);
+            }
+        }
+        self.frame(device);
+        Ok(())
+    }
+
+    /// Inject one validated discrete wheel frame. libei defines these values
+    /// as multiples of 120 per wheel click; treating them as pixel deltas
+    /// makes remote scrolling dramatically faster than the source desktop.
+    pub fn inject_scroll_discrete(
+        &mut self,
+        horizontal: i32,
+        vertical: i32,
+        finish: bool,
+    ) -> io::Result<()> {
+        validate_discrete_axis_pair(horizontal, vertical)?;
+        let device = self.require_ready(self.scroll, "scroll")?;
+        self.ensure_emulating(device);
+        unsafe {
+            ei_device_scroll_discrete(device.as_ptr(), horizontal, vertical);
+            if finish {
+                ei_device_scroll_stop(device.as_ptr(), horizontal != 0, vertical != 0);
             }
         }
         self.frame(device);
@@ -531,6 +554,17 @@ fn validate_axis_pair(x: f64, y: f64, kind: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_discrete_axis_pair(x: i32, y: i32) -> io::Result<()> {
+    const MAX_DISCRETE_SCROLL: i64 = 2_048;
+    if i64::from(x).abs() > MAX_DISCRETE_SCROLL || i64::from(y).abs() > MAX_DISCRETE_SCROLL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("discrete scroll delta exceeds the per-frame limit of {MAX_DISCRETE_SCROLL}"),
+        ));
+    }
+    Ok(())
+}
+
 fn update_pressed(pressed: &mut BTreeSet<u16>, code: u16, state: InputState) -> bool {
     match state {
         InputState::Pressed => pressed.insert(code),
@@ -619,6 +653,8 @@ mod tests {
         assert!(validate_axis_pair(10.0, -10.0, "motion").is_ok());
         assert!(validate_axis_pair(f64::NAN, 0.0, "motion").is_err());
         assert!(validate_axis_pair(MAX_AXIS_DELTA + 1.0, 0.0, "motion").is_err());
+        assert!(validate_discrete_axis_pair(120, -120).is_ok());
+        assert!(validate_discrete_axis_pair(2_049, 0).is_err());
     }
 
     #[test]

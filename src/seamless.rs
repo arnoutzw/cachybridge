@@ -42,6 +42,10 @@ pub struct InputCaptureAdapter {
     /// scrolling stay ordered and uncoalesced; pointer motion is safe to
     /// batch and avoids a burst of individually framed network packets.
     pending_motion: (i32, i32),
+    /// A source compositor may report the same physical scroll both as a
+    /// smooth pixel delta and as a 120-unit wheel click before its Frame.
+    /// Smooth data is authoritative, so suppress that duplicate click.
+    smooth_scroll_axes: (bool, bool),
     motion_rate: MotionRate,
     pending: VecDeque<CapturedInput>,
 }
@@ -243,6 +247,7 @@ impl InputCaptureAdapter {
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
+            smooth_scroll_axes: (false, false),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -263,6 +268,7 @@ impl InputCaptureAdapter {
             active_activation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
+            smooth_scroll_axes: (false, false),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -311,10 +317,45 @@ impl InputCaptureAdapter {
                 crate::libei_capture::CapturedEvent::RelativePointer { dx, dy } => {
                     self.queue_motion(rounded_delta(dx)?, rounded_delta(dy)?);
                 }
+                crate::libei_capture::CapturedEvent::ScrollDelta {
+                    horizontal,
+                    vertical,
+                } => {
+                    self.flush_motion();
+                    self.smooth_scroll_axes.0 |= horizontal != 0.0;
+                    self.smooth_scroll_axes.1 |= vertical != 0.0;
+                    self.pending.extend(
+                        captured_to_wire(crate::libei_capture::CapturedEvent::ScrollDelta {
+                            horizontal,
+                            vertical,
+                        })?
+                        .into_iter()
+                        .map(CapturedInput::Event),
+                    );
+                }
+                crate::libei_capture::CapturedEvent::ScrollDiscrete {
+                    horizontal,
+                    vertical,
+                } => {
+                    self.flush_motion();
+                    // Avoid double injection when the same physical scroll
+                    // was also delivered as a smooth pixel update this frame.
+                    let horizontal = if self.smooth_scroll_axes.0 { 0 } else { horizontal };
+                    let vertical = if self.smooth_scroll_axes.1 { 0 } else { vertical };
+                    self.pending.extend(
+                        captured_to_wire(crate::libei_capture::CapturedEvent::ScrollDiscrete {
+                            horizontal,
+                            vertical,
+                        })?
+                        .into_iter()
+                        .map(CapturedInput::Event),
+                    );
+                }
                 // InputCapture frames delimit a compositor update. Send one
                 // coherent move before transitions or this frame boundary.
                 crate::libei_capture::CapturedEvent::Frame { .. } => {
                     self.flush_motion();
+                    self.smooth_scroll_axes = (false, false);
                 }
                 event => {
                     self.flush_motion();
@@ -449,23 +490,16 @@ fn captured_to_wire(event: crate::libei_capture::CapturedEvent) -> io::Result<Ve
     const SYN_REPORT: u16 = 0;
     const REL_HWHEEL: u16 = 6;
     const REL_WHEEL: u16 = 8;
+    // These remain encrypted application markers; they are never emitted to
+    // a Linux input device. Keeping smooth data distinct from wheel clicks
+    // lets the client call the matching libei API.
+    const REL_WHEEL_HI_RES: u16 = 11;
+    const REL_HWHEEL_HI_RES: u16 = 12;
 
     let wire_event = |event_type, code, value| WireInputEvent {
         event_type,
         code,
         value,
-    };
-    let axes = |horizontal: f64, vertical: f64| -> io::Result<Vec<WireInputEvent>> {
-        let mut output = Vec::with_capacity(2);
-        let horizontal = rounded_delta(horizontal)?;
-        let vertical = rounded_delta(vertical)?;
-        if horizontal != 0 {
-            output.push(wire_event(EV_REL, REL_HWHEEL, horizontal));
-        }
-        if vertical != 0 {
-            output.push(wire_event(EV_REL, REL_WHEEL, vertical));
-        }
-        Ok(output)
     };
     match event {
         CapturedEvent::RelativePointer { dx, dy } => {
@@ -481,7 +515,18 @@ fn captured_to_wire(event: crate::libei_capture::CapturedEvent) -> io::Result<Ve
         CapturedEvent::ScrollDelta {
             horizontal,
             vertical,
-        } => axes(horizontal, vertical),
+        } => {
+            let mut output = Vec::with_capacity(2);
+            let horizontal = rounded_delta(horizontal)?;
+            let vertical = rounded_delta(vertical)?;
+            if horizontal != 0 {
+                output.push(wire_event(EV_REL, REL_HWHEEL_HI_RES, horizontal));
+            }
+            if vertical != 0 {
+                output.push(wire_event(EV_REL, REL_WHEEL_HI_RES, vertical));
+            }
+            Ok(output)
+        }
         CapturedEvent::ScrollDiscrete {
             horizontal,
             vertical,
@@ -605,18 +650,26 @@ impl InjectBackend for RemoteDesktopInjector {
         const REL_Y: u16 = 1;
         const REL_HWHEEL: u16 = 6;
         const REL_WHEEL: u16 = 8;
+        const REL_WHEEL_HI_RES: u16 = 11;
+        const REL_HWHEEL_HI_RES: u16 = 12;
         const BTN_MOUSE_FIRST: u16 = 0x110;
 
         match (event.event_type, event.code) {
             (EV_SYN, SYN_REPORT) => Ok(()),
             (EV_REL, REL_X) => self.session.inject_relative(f64::from(event.value), 0.0),
             (EV_REL, REL_Y) => self.session.inject_relative(0.0, f64::from(event.value)),
-            (EV_REL, REL_HWHEEL) => self
+            (EV_REL, REL_HWHEEL_HI_RES) => self
                 .session
                 .inject_scroll(f64::from(event.value), 0.0, false),
-            (EV_REL, REL_WHEEL) => self
+            (EV_REL, REL_WHEEL_HI_RES) => self
                 .session
                 .inject_scroll(0.0, f64::from(event.value), false),
+            (EV_REL, REL_HWHEEL) => self
+                .session
+                .inject_scroll_discrete(event.value, 0, false),
+            (EV_REL, REL_WHEEL) => self
+                .session
+                .inject_scroll_discrete(0, event.value, false),
             (EV_KEY, code) if code >= BTN_MOUSE_FIRST => self
                 .session
                 .inject_button(code, Self::input_state(event.value)?),
@@ -1332,6 +1385,50 @@ mod tests {
                     y: 500,
                 },
                 Message::EnterAck,
+            ]
+        );
+    }
+
+    #[test]
+    fn scroll_wire_preserves_smooth_and_discrete_units() {
+        use crate::libei_capture::CapturedEvent;
+
+        assert_eq!(
+            captured_to_wire(CapturedEvent::ScrollDelta {
+                horizontal: 2.0,
+                vertical: -7.0,
+            })
+            .unwrap(),
+            vec![
+                WireInputEvent {
+                    event_type: 2,
+                    code: 12,
+                    value: 2,
+                },
+                WireInputEvent {
+                    event_type: 2,
+                    code: 11,
+                    value: -7,
+                },
+            ]
+        );
+        assert_eq!(
+            captured_to_wire(CapturedEvent::ScrollDiscrete {
+                horizontal: 120,
+                vertical: -120,
+            })
+            .unwrap(),
+            vec![
+                WireInputEvent {
+                    event_type: 2,
+                    code: 6,
+                    value: 120,
+                },
+                WireInputEvent {
+                    event_type: 2,
+                    code: 8,
+                    value: -120,
+                },
             ]
         );
     }
