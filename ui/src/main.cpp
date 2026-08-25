@@ -1,6 +1,5 @@
 #include <QApplication>
 #include <QAbstractItemView>
-#include <QCheckBox>
 #include <QCommandLineParser>
 #include <QDateTime>
 #include <QDialog>
@@ -872,28 +871,20 @@ class SetupWindow final : public QWidget {
 public:
     explicit SetupWindow(std::unique_ptr<SetupStore> store, MachineRole role)
         : store_(std::move(store)), role_(role) {
-        setWindowTitle(QStringLiteral("CachyBridge Setup"));
+        setWindowTitle(QStringLiteral("CachyBridge"));
         setMinimumWidth(580);
 
-        auto *heading = new QLabel(QStringLiteral("CachyBridge"));
-        QFont headingFont = heading->font();
-        headingFont.setPointSize(headingFont.pointSize() + 4);
-        headingFont.setBold(true);
-        heading->setFont(headingFont);
-
         auto *roleBanner = new QLabel(role_ == MachineRole::Host
-            ? QStringLiteral("THIS IMAC: HOST / MASTER  —  owns the physical mouse and keyboard")
-            : QStringLiteral("THIS IMAC: CLIENT / SLAVE  —  receives shared mouse and keyboard input"));
+            ? QStringLiteral("Host · controls mouse and keyboard")
+            : QStringLiteral("Client · receives shared input"));
         QFont roleFont = roleBanner->font();
-        roleFont.setPointSize(roleFont.pointSize() + 2);
+        roleFont.setPointSize(roleFont.pointSize() + 1);
         roleFont.setBold(true);
         roleBanner->setFont(roleFont);
-        roleBanner->setWordWrap(true);
         roleBanner->setStyleSheet(QStringLiteral(
-            "QLabel { padding: 8px 10px; border: 1px solid palette(highlight); "
-            "border-radius: 6px; background: palette(alternate-base); }"));
+            "QLabel { padding: 2px 0; color: palette(highlight); }"));
 
-        hostName_ = new QLineEdit(QSysInfo::machineHostName(), this);
+        localName_ = QSysInfo::machineHostName();
         pairingCode_ = new QLineEdit;
         pairingCode_->setPlaceholderText(QStringLiteral("ABCDE"));
         pairingCode_->setMaxLength(5);
@@ -951,8 +942,7 @@ public:
                 QMessageBox::critical(this, QStringLiteral("Could not create code"), error);
                 return;
             }
-            SetupDraft draft{hostName_->text().trimmed(), {}, {}, {}, {},
-                selectedPlacement(), persistent_->isChecked()};
+            SetupDraft draft{localName_, {}, {}, {}, {}, selectedPlacement(), true};
             hostPairingProcess_ = new QProcess(this);
             const QString startError = store_->startPairClient(draft, code, hostPairingProcess_);
             if (!startError.isEmpty()) {
@@ -1055,23 +1045,27 @@ public:
                 QStringLiteral("Restart the CachyBridge sharing session on both iMacs to begin syncing text."));
         });
         auto *nearbyClients = new QListWidget;
-        nearbyClients->setMinimumHeight(150);
+        nearbyClients->setMinimumHeight(62);
+        nearbyClients->setMaximumHeight(160);
         nearbyClients->setSelectionMode(QAbstractItemView::SingleSelection);
         nearbyClients->setToolTip(QStringLiteral(
             "Only client iMacs with the CachyBridge tray open appear here."));
         nearbyClients->setStyleSheet(QStringLiteral(
             "QListWidget { border: 1px solid palette(mid); border-radius: 6px; }"
             "QListWidget::item { border-bottom: 1px solid palette(mid); }"));
-        auto *refreshClients = new QPushButton(QStringLiteral("Refresh"));
         auto *joinButton = new QPushButton(QStringLiteral("Pair selected client"));
         joinButton->setEnabled(false);
+        auto *pairingEntry = new QWidget;
+        auto *pairingEntryLayout = new QVBoxLayout(pairingEntry);
+        pairingEntryLayout->setContentsMargins(0, 0, 0, 0);
+        pairingEntry->setVisible(false);
         QFont pairingCodeFont = pairingCode_->font();
         pairingCodeFont.setPointSize(pairingCodeFont.pointSize() + 6);
         pairingCodeFont.setBold(true);
         pairingCode_->setFont(pairingCodeFont);
         connect(joinButton, &QPushButton::clicked, this, [this] {
-            const PairJoinDraft draft{hostName_->text().trimmed(), pairingAddress_->text().trimmed(),
-                pairingCode_->text().trimmed(), selectedPlacement(), persistent_->isChecked()};
+            const PairJoinDraft draft{localName_, pairingAddress_->text().trimmed(),
+                pairingCode_->text().trimmed(), selectedPlacement(), true};
             if (draft.localName.isEmpty() || draft.clientAddress.isEmpty() || draft.code.isEmpty()) {
                 pairingStatus_->setText(QStringLiteral(
                     "Select a nearby client, then enter the five-character code shown on that client."));
@@ -1101,7 +1095,9 @@ public:
             });
         });
         auto *joinForm = new QFormLayout;
-        joinForm->addRow(QStringLiteral("Code from selected client"), pairingCode_);
+        joinForm->addRow(QStringLiteral("Pairing code"), pairingCode_);
+        pairingEntryLayout->addLayout(joinForm);
+        pairingEntryLayout->addWidget(joinButton);
         const auto refreshNearbyClients = [this, nearbyClients, joinButton] {
             QString error;
             const QStringList clients = store_->discoverPairClients(&error);
@@ -1128,7 +1124,8 @@ public:
                 if (separator <= 0)
                     continue;
                 const QString endpoint = client.left(separator);
-                const QString name = client.sliced(separator + 1);
+                QString name = client.sliced(separator + 1).trimmed();
+                name.remove(QStringLiteral("CachyBridge "), Qt::CaseInsensitive);
                 const bool connected = isAddressConnected(endpoint, connectedAddresses);
                 const QString peerId = pairingError.isEmpty()
                     ? peerIdForClientEndpoint(peers, endpoint) : QString();
@@ -1147,7 +1144,7 @@ public:
                 item->setData(Qt::UserRole + 1, paired);
                 item->setData(Qt::UserRole + 2, connected);
                 item->setData(Qt::UserRole + 3, current);
-                item->setSizeHint(QSize(0, 58));
+                item->setSizeHint(QSize(0, paired ? 42 : 58));
                 item->setToolTip(connected
                     ? QStringLiteral("A live CachyBridge KVM or clipboard connection is active.")
                     : (paired ? QStringLiteral("This iMac already has a saved CachyBridge pairing.")
@@ -1161,10 +1158,12 @@ public:
                 QFont nameFont = nameLabel->font();
                 nameFont.setBold(true);
                 nameLabel->setFont(nameFont);
-                auto *endpointLabel = new QLabel(endpoint);
-                endpointLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
                 details->addWidget(nameLabel);
-                details->addWidget(endpointLabel);
+                if (!paired) {
+                    auto *endpointLabel = new QLabel(endpoint);
+                    endpointLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+                    details->addWidget(endpointLabel);
+                }
                 auto *stateLabel = new QLabel(state);
                 stateLabel->setStyleSheet(QStringLiteral(
                     "QLabel { %1 padding: 3px 6px; border-radius: 4px; font-weight: 600; }").arg(stateStyle));
@@ -1172,13 +1171,12 @@ public:
                 rowLayout->addWidget(stateLabel);
                 nearbyClients->setItemWidget(item, row);
             }
-            pairingStatus_->setText(QStringLiteral(
-                "Green is connected; blue is already paired. Select a ready client to pair."));
+            pairingStatus_->clear();
         };
-        connect(refreshClients, &QPushButton::clicked, this, refreshNearbyClients);
         connect(nearbyClients, &QListWidget::currentItemChanged, this,
-            [this, joinButton](QListWidgetItem *item, QListWidgetItem *) {
+            [this, joinButton, pairingEntry](QListWidgetItem *item, QListWidgetItem *) {
                 joinButton->setEnabled(false);
+                pairingEntry->setVisible(false);
                 if (!item)
                     return;
                 const bool paired = item->data(Qt::UserRole + 1).toBool();
@@ -1201,6 +1199,7 @@ public:
                 pairingCode_->clear();
                 pairingCode_->setFocus();
                 joinButton->setEnabled(true);
+                pairingEntry->setVisible(true);
                 pairingStatus_->setText(QStringLiteral(
                     "The selected client is showing a large pairing code. Enter it here, then pair."));
             });
@@ -1212,9 +1211,7 @@ public:
         hostConnectLayout->setContentsMargins(0, 0, 0, 0);
         hostConnectLayout->addWidget(new QLabel(QStringLiteral("Client iMacs")));
         hostConnectLayout->addWidget(nearbyClients);
-        hostConnectLayout->addWidget(refreshClients);
-        hostConnectLayout->addLayout(joinForm);
-        hostConnectLayout->addWidget(joinButton);
+        hostConnectLayout->addWidget(pairingEntry);
         easyLayout->addWidget(hostConnectPanel_);
         if (role_ == MachineRole::Host) {
             QTimer::singleShot(0, this, refreshNearbyClients);
@@ -1231,7 +1228,10 @@ public:
             discoveryRefresh->start();
         }
 
-        auto *unpairButton = new QPushButton(QStringLiteral("Unpair this iMac"));
+        auto *unpairButton = new QPushButton(QStringLiteral("Unpair…"));
+        unpairButton->setFlat(true);
+        unpairButton->setStyleSheet(QStringLiteral(
+            "QPushButton { color: palette(link); padding: 4px; }"));
         unpairButton->setToolTip(QStringLiteral(
             "Stops sharing and removes the trusted pairing and local portal permissions from this iMac."));
         connect(unpairButton, &QPushButton::clicked, this, [this, unpairButton] {
@@ -1267,7 +1267,7 @@ public:
             QMessageBox::information(this, QStringLiteral("This iMac is unpaired"),
                 QStringLiteral("Sharing has stopped and the local CachyBridge pairing was removed."));
         });
-        easyLayout->addWidget(unpairButton);
+        easyLayout->addWidget(unpairButton, 0, Qt::AlignRight);
 
         auto *placementBox = new QWidget;
         auto *placementLayout = new QVBoxLayout(placementBox);
@@ -1339,13 +1339,6 @@ public:
                 QStringLiteral("The session is reconnecting with the new cursor boundary."));
         });
         placementLayout->addWidget(applyPlacement);
-
-        persistent_ = new QCheckBox(
-            QStringLiteral("Remember desktop portal permissions (recommended on these two iMacs)"));
-        persistent_->setChecked(true);
-        persistent_->setToolTip(QStringLiteral(
-            "Stores portal-issued single-use restore tokens in the private CachyBridge configuration."));
-        easyLayout->addWidget(persistent_);
 
         auto *clipboardViewer = new QWidget;
         auto *clipboardLayout = new QVBoxLayout(clipboardViewer);
@@ -1456,7 +1449,6 @@ public:
         showClipboard();
 
         auto *layout = new QVBoxLayout(this);
-        layout->addWidget(heading);
         layout->addWidget(roleBanner);
         auto *tabs = new QTabWidget;
         tabs->addTab(easyPairing, QStringLiteral("Connect"));
@@ -1657,19 +1649,18 @@ private:
     }
 
     std::unique_ptr<SetupStore> store_;
-    QLineEdit *hostName_ = nullptr;
     QLineEdit *pairingCode_ = nullptr;
     QLineEdit *pairingAddress_ = nullptr;
     DisplayLayoutPreview *placementPreview_ = nullptr;
     QSpinBox *clientWidth_ = nullptr;
     QSpinBox *clientHeight_ = nullptr;
-    QCheckBox *persistent_ = nullptr;
     QLabel *pairingStatus_ = nullptr;
     QWidget *clientCodeCard_ = nullptr;
     QLabel *pairingCodeDisplay_ = nullptr;
     QLabel *pairingAddressDisplay_ = nullptr;
     QProcess *hostPairingProcess_ = nullptr;
     QWidget *hostConnectPanel_ = nullptr;
+    QString localName_;
     QString activePeerId_;
     MachineRole role_;
 };
