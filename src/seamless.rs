@@ -8,9 +8,11 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
+    os::fd::AsRawFd,
     time::{Duration, Instant},
 };
 
+use evdev::{enumerate, AbsoluteAxisType, Device};
 use thiserror::Error;
 
 use crate::{
@@ -47,6 +49,10 @@ pub struct InputCaptureAdapter {
     /// Smooth data is authoritative, so suppress that duplicate click.
     smooth_scroll_axes: (bool, bool),
     pinch_zoom: PinchZoomTracker,
+    /// KWin consumes Magic Trackpad contacts as gestures before they reach
+    /// InputCapture. Read the trackpad's multitouch stream directly so a
+    /// pinch remains available while the pointer is on the paired desktop.
+    raw_trackpad_pinch: Option<RawTrackpadPinchCapture>,
     motion_rate: MotionRate,
     pending: VecDeque<CapturedInput>,
 }
@@ -253,7 +259,7 @@ impl PinchZoomTracker {
     const EV_KEY: u16 = 1;
     const EV_REL: u16 = 2;
     const KEY_LEFTCTRL: u16 = 29;
-    const REL_WHEEL_HI_RES: u16 = 11;
+    const REL_WHEEL: u16 = 8;
 
     fn down(&mut self, id: u32, x: u16, y: u16) -> Vec<WireInputEvent> {
         self.contacts.insert(id, (x, y));
@@ -282,11 +288,7 @@ impl PinchZoomTracker {
             self.control_held = true;
             events.push(Self::event(Self::EV_KEY, Self::KEY_LEFTCTRL, 1));
         }
-        events.push(Self::event(
-            Self::EV_REL,
-            Self::REL_WHEEL_HI_RES,
-            steps * 120,
-        ));
+        events.push(Self::event(Self::EV_REL, Self::REL_WHEEL, steps * 120));
         events
     }
 
@@ -332,6 +334,179 @@ impl PinchZoomTracker {
     }
 }
 
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 0x800;
+const RAW_TRACKPAD_POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+unsafe extern "C" {
+    fn fcntl(fd: i32, command: i32, ...) -> i32;
+}
+
+#[derive(Debug, Default)]
+struct RawTrackpadContact {
+    id: Option<u32>,
+    x: Option<i32>,
+    y: Option<i32>,
+    forwarded: bool,
+}
+
+/// Magic Trackpad's raw ABS_MT contacts. This supplements the portal path;
+/// it never grabs the device or forwards pointer/button data, so Plasma keeps
+/// full local ownership until a normal edge handoff is active.
+struct RawTrackpadPinchCapture {
+    device: Device,
+    current_slot: usize,
+    contacts: BTreeMap<usize, RawTrackpadContact>,
+    x_range: (i32, i32),
+    y_range: (i32, i32),
+    pinch: PinchZoomTracker,
+}
+
+impl RawTrackpadPinchCapture {
+    fn open() -> io::Result<Option<Self>> {
+        let Some((path, device)) = enumerate().find(|(_, device)| {
+            device
+                .name()
+                .is_some_and(|name| name.to_ascii_lowercase().contains("magic trackpad"))
+        }) else {
+            return Ok(None);
+        };
+        set_nonblocking(&device)?;
+        let axes = device.get_abs_state()?;
+        let x = axes[usize::from(AbsoluteAxisType::ABS_MT_POSITION_X.0)];
+        let y = axes[usize::from(AbsoluteAxisType::ABS_MT_POSITION_Y.0)];
+        if x.maximum <= x.minimum || y.maximum <= y.minimum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} has invalid multitouch coordinate ranges",
+                    path.display()
+                ),
+            ));
+        }
+        eprintln!(
+            "pinch zoom: direct Magic Trackpad capture enabled ({})",
+            path.display()
+        );
+        Ok(Some(Self {
+            device,
+            current_slot: 0,
+            contacts: BTreeMap::new(),
+            x_range: (x.minimum, x.maximum),
+            y_range: (y.minimum, y.maximum),
+            pinch: PinchZoomTracker::default(),
+        }))
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        // Do not treat fingers that were already down before the edge crossing
+        // as a new remote gesture. Empty the non-grabbed kernel ring first.
+        loop {
+            match self.device.fetch_events() {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        self.current_slot = 0;
+        self.contacts.clear();
+        self.pinch = PinchZoomTracker::default();
+        Ok(())
+    }
+
+    fn drain(&mut self) -> io::Result<Vec<WireInputEvent>> {
+        let mut output = Vec::new();
+        loop {
+            let events = match self.device.fetch_events() {
+                Ok(events) => events
+                    .map(|event| (event.event_type().0, event.code(), event.value()))
+                    .collect::<Vec<_>>(),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(output),
+                Err(error) => return Err(error),
+            };
+            for (event_type, code, value) in events {
+                // Never mistake a touchpad button/key event for an absolute
+                // axis merely because Linux input codes share the same range.
+                if event_type == 3 {
+                    self.process(code, value, &mut output);
+                }
+            }
+        }
+    }
+
+    fn process(&mut self, code: u16, value: i32, output: &mut Vec<WireInputEvent>) {
+        const ABS_MT_SLOT: u16 = AbsoluteAxisType::ABS_MT_SLOT.0;
+        const ABS_MT_POSITION_X: u16 = AbsoluteAxisType::ABS_MT_POSITION_X.0;
+        const ABS_MT_POSITION_Y: u16 = AbsoluteAxisType::ABS_MT_POSITION_Y.0;
+        const ABS_MT_TRACKING_ID: u16 = AbsoluteAxisType::ABS_MT_TRACKING_ID.0;
+
+        match code {
+            ABS_MT_SLOT if value >= 0 => self.current_slot = value as usize,
+            ABS_MT_TRACKING_ID if value < 0 => {
+                if let Some(contact) = self.contacts.remove(&self.current_slot) {
+                    if contact.forwarded {
+                        output.extend(self.pinch.up(contact.id.expect("forwarded contact has id")));
+                    }
+                }
+            }
+            ABS_MT_TRACKING_ID => {
+                self.contacts.insert(
+                    self.current_slot,
+                    RawTrackpadContact {
+                        id: Some(value as u32),
+                        ..Default::default()
+                    },
+                );
+            }
+            ABS_MT_POSITION_X | ABS_MT_POSITION_Y => {
+                let Some(contact) = self.contacts.get_mut(&self.current_slot) else {
+                    return;
+                };
+                if code == ABS_MT_POSITION_X {
+                    contact.x = Some(value);
+                } else {
+                    contact.y = Some(value);
+                }
+                let (Some(id), Some(x), Some(y)) = (contact.id, contact.x, contact.y) else {
+                    return;
+                };
+                let x = normalize_trackpad_coordinate(x, self.x_range);
+                let y = normalize_trackpad_coordinate(y, self.y_range);
+                if contact.forwarded {
+                    output.extend(self.pinch.motion(id, x, y));
+                } else {
+                    contact.forwarded = true;
+                    output.extend(self.pinch.down(id, x, y));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn normalize_trackpad_coordinate(value: i32, range: (i32, i32)) -> u16 {
+    let (minimum, maximum) = range;
+    let bounded = value.clamp(minimum, maximum);
+    let width = i64::from(maximum - minimum);
+    let offset = i64::from(bounded - minimum);
+    ((offset * i64::from(u16::MAX)) / width) as u16
+}
+
+fn set_nonblocking(device: &Device) -> io::Result<()> {
+    let fd = device.as_raw_fd();
+    // SAFETY: `fd` belongs to `device` for the duration of both calls.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL takes one integer flags argument.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl InputCaptureAdapter {
     pub fn start(
         edge: crate::portal_spike::CaptureEdge,
@@ -348,6 +523,7 @@ impl InputCaptureAdapter {
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
             pinch_zoom: PinchZoomTracker::default(),
+            raw_trackpad_pinch: Self::open_raw_trackpad(),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -370,6 +546,7 @@ impl InputCaptureAdapter {
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
             pinch_zoom: PinchZoomTracker::default(),
+            raw_trackpad_pinch: Self::open_raw_trackpad(),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -392,6 +569,18 @@ impl InputCaptureAdapter {
 
     pub fn take_restore_token(&mut self) -> Option<crate::portal_persistence::RestoreToken> {
         self.session.take_restore_token()
+    }
+
+    fn open_raw_trackpad() -> Option<RawTrackpadPinchCapture> {
+        match RawTrackpadPinchCapture::open() {
+            Ok(capture) => capture,
+            Err(error) => {
+                // The portal handoff remains fully usable when a particular
+                // trackpad is unavailable or access is denied.
+                eprintln!("pinch zoom: direct Magic Trackpad capture unavailable: {error}");
+                None
+            }
+        }
     }
 
     fn queue_motion(&mut self, dx: i32, dy: i32) {
@@ -571,6 +760,9 @@ impl CaptureBackend for InputCaptureAdapter {
 
     fn begin_remote_input(&mut self) -> io::Result<()> {
         if self.active_activation.is_some() {
+            if let Some(trackpad) = &mut self.raw_trackpad_pinch {
+                trackpad.reset()?;
+            }
             Ok(())
         } else {
             Err(io::Error::new(
@@ -584,6 +776,13 @@ impl CaptureBackend for InputCaptureAdapter {
         if let Some(event) = self.pending.pop_front() {
             return Ok(Some(event));
         }
+        if let Some(trackpad) = &mut self.raw_trackpad_pinch {
+            self.pending
+                .extend(trackpad.drain()?.into_iter().map(CapturedInput::Event));
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+        }
         match self.session.poll_signal(Duration::ZERO)? {
             Some(crate::portal_spike::CaptureSignal::Deactivated { .. })
             | Some(crate::portal_spike::CaptureSignal::Disabled) => {
@@ -594,8 +793,21 @@ impl CaptureBackend for InputCaptureAdapter {
             }
             Some(_) | None => {}
         }
+        // Poll the direct trackpad stream at 125 Hz. Portal pointer capture
+        // remains the authority for regular input; this shorter poll only
+        // prevents a compositor-consumed pinch from waiting for the 1 s
+        // heartbeat interval.
+        let timeout = if self.raw_trackpad_pinch.is_some() {
+            timeout.min(RAW_TRACKPAD_POLL_INTERVAL)
+        } else {
+            timeout
+        };
         let batch = self.session.dispatch_events(timeout)?;
         self.drain_batch(batch)?;
+        if let Some(trackpad) = &mut self.raw_trackpad_pinch {
+            self.pending
+                .extend(trackpad.drain()?.into_iter().map(CapturedInput::Event));
+        }
         Ok(self.pending.pop_front())
     }
 
@@ -619,6 +831,9 @@ impl CaptureBackend for InputCaptureAdapter {
     fn release_local_input(&mut self, restore: Option<Point>) -> io::Result<()> {
         self.absolute_motion.reset();
         self.pending_motion = (0, 0);
+        if let Some(trackpad) = &mut self.raw_trackpad_pinch {
+            trackpad.reset()?;
+        }
         let release_result = if let Some(activation_id) = self.active_activation.take() {
             self.session
                 .release(
@@ -929,6 +1144,7 @@ pub struct SeamlessHost<C, T> {
     controller: HandoffController,
     capture: C,
     transport: T,
+    last_peer_activity: Instant,
 }
 
 impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
@@ -937,6 +1153,7 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
             controller,
             capture,
             transport,
+            last_peer_activity: Instant::now(),
         }
     }
 
@@ -987,6 +1204,7 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
             CapturedInput::Event(event) => self.transport.send(Message::Input(event))?,
             CapturedInput::Touch(event) => self.transport.send(Message::Touch(event))?,
         }
+        self.last_peer_activity = Instant::now();
         Ok(())
     }
 
@@ -1010,8 +1228,12 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
                 }
             }
             None => {
-                if matches!(self.controller.state(), HandoffState::RemoteActive { .. }) {
+                if matches!(self.controller.state(), HandoffState::RemoteActive { .. })
+                    && self.last_peer_activity.elapsed()
+                        >= Duration::from_millis(crate::protocol::HEARTBEAT_INTERVAL_MS)
+                {
                     self.transport.send(Message::Heartbeat)?;
+                    self.last_peer_activity = Instant::now();
                 }
                 Ok(())
             }
@@ -1417,7 +1639,7 @@ mod tests {
                 },
                 WireInputEvent {
                     event_type: 2,
-                    code: 11,
+                    code: 8,
                     value: 240,
                 },
             ]
