@@ -6,7 +6,7 @@
 //! injected, and every close/error path first releases local/remote input.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io,
     time::{Duration, Instant},
 };
@@ -46,6 +46,7 @@ pub struct InputCaptureAdapter {
     /// smooth pixel delta and as a 120-unit wheel click before its Frame.
     /// Smooth data is authoritative, so suppress that duplicate click.
     smooth_scroll_axes: (bool, bool),
+    pinch_zoom: PinchZoomTracker,
     motion_rate: MotionRate,
     pending: VecDeque<CapturedInput>,
 }
@@ -234,6 +235,103 @@ impl AbsoluteMotionTracker {
     }
 }
 
+/// Converts two-finger Magic Trackpad distance changes into Ctrl+scroll zoom
+/// input. This is the desktop-native zoom convention used by browsers, Qt,
+/// GTK, and most document viewers. The original touch contacts still travel
+/// over the encrypted touch path for applications that consume touchscreen
+/// input directly.
+#[derive(Debug, Default)]
+struct PinchZoomTracker {
+    contacts: BTreeMap<u32, (u16, u16)>,
+    previous_distance: Option<f64>,
+    accumulated_distance: f64,
+    control_held: bool,
+}
+
+impl PinchZoomTracker {
+    const STEP_DISTANCE: f64 = 1_200.0;
+    const EV_KEY: u16 = 1;
+    const EV_REL: u16 = 2;
+    const KEY_LEFTCTRL: u16 = 29;
+    const REL_WHEEL_HI_RES: u16 = 11;
+
+    fn down(&mut self, id: u32, x: u16, y: u16) -> Vec<WireInputEvent> {
+        self.contacts.insert(id, (x, y));
+        self.reset_reference_if_needed()
+    }
+
+    fn motion(&mut self, id: u32, x: u16, y: u16) -> Vec<WireInputEvent> {
+        let Some(contact) = self.contacts.get_mut(&id) else {
+            return Vec::new();
+        };
+        *contact = (x, y);
+        let Some(distance) = self.distance() else {
+            return self.reset_reference_if_needed();
+        };
+        let Some(previous) = self.previous_distance.replace(distance) else {
+            return Vec::new();
+        };
+        self.accumulated_distance += distance - previous;
+        let steps = (self.accumulated_distance / Self::STEP_DISTANCE).trunc() as i32;
+        if steps == 0 {
+            return Vec::new();
+        }
+        self.accumulated_distance -= f64::from(steps) * Self::STEP_DISTANCE;
+        let mut events = Vec::with_capacity(2);
+        if !self.control_held {
+            self.control_held = true;
+            events.push(Self::event(Self::EV_KEY, Self::KEY_LEFTCTRL, 1));
+        }
+        events.push(Self::event(
+            Self::EV_REL,
+            Self::REL_WHEEL_HI_RES,
+            steps * 120,
+        ));
+        events
+    }
+
+    fn up(&mut self, id: u32) -> Vec<WireInputEvent> {
+        self.contacts.remove(&id);
+        let mut events = self.reset_reference_if_needed();
+        if self.contacts.len() < 2 && self.control_held {
+            self.control_held = false;
+            events.push(Self::event(Self::EV_KEY, Self::KEY_LEFTCTRL, 0));
+        }
+        events
+    }
+
+    fn distance(&self) -> Option<f64> {
+        if self.contacts.len() != 2 {
+            return None;
+        }
+        let mut contacts = self.contacts.values();
+        let (first_x, first_y) = *contacts.next().expect("two contacts are present");
+        let (second_x, second_y) = *contacts.next().expect("two contacts are present");
+        let dx = f64::from(i32::from(first_x) - i32::from(second_x));
+        let dy = f64::from(i32::from(first_y) - i32::from(second_y));
+        Some(dx.hypot(dy))
+    }
+
+    fn reset_reference_if_needed(&mut self) -> Vec<WireInputEvent> {
+        if let Some(distance) = self.distance() {
+            self.previous_distance = Some(distance);
+            self.accumulated_distance = 0.0;
+        } else {
+            self.previous_distance = None;
+            self.accumulated_distance = 0.0;
+        }
+        Vec::new()
+    }
+
+    const fn event(event_type: u16, code: u16, value: i32) -> WireInputEvent {
+        WireInputEvent {
+            event_type,
+            code,
+            value,
+        }
+    }
+}
+
 impl InputCaptureAdapter {
     pub fn start(
         edge: crate::portal_spike::CaptureEdge,
@@ -249,6 +347,7 @@ impl InputCaptureAdapter {
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
+            pinch_zoom: PinchZoomTracker::default(),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -270,6 +369,7 @@ impl InputCaptureAdapter {
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
+            pinch_zoom: PinchZoomTracker::default(),
             motion_rate: MotionRate::new("capture"),
             pending: VecDeque::new(),
         })
@@ -362,6 +462,12 @@ impl InputCaptureAdapter {
                 }
                 crate::libei_capture::CapturedEvent::TouchDown { id, x, y } => {
                     self.flush_motion();
+                    self.pending.extend(
+                        self.pinch_zoom
+                            .down(id, x, y)
+                            .into_iter()
+                            .map(CapturedInput::Event),
+                    );
                     self.pending.push_back(CapturedInput::Touch(WireTouchEvent {
                         phase: TouchPhase::Down,
                         id,
@@ -371,6 +477,12 @@ impl InputCaptureAdapter {
                 }
                 crate::libei_capture::CapturedEvent::TouchMotion { id, x, y } => {
                     self.flush_motion();
+                    self.pending.extend(
+                        self.pinch_zoom
+                            .motion(id, x, y)
+                            .into_iter()
+                            .map(CapturedInput::Event),
+                    );
                     self.pending.push_back(CapturedInput::Touch(WireTouchEvent {
                         phase: TouchPhase::Motion,
                         id,
@@ -390,6 +502,8 @@ impl InputCaptureAdapter {
                         x: 0,
                         y: 0,
                     }));
+                    self.pending
+                        .extend(self.pinch_zoom.up(id).into_iter().map(CapturedInput::Event));
                 }
                 // InputCapture frames delimit a compositor update. Send one
                 // coherent move before transitions or this frame boundary.
@@ -1286,6 +1400,36 @@ mod tests {
         let (capture, transport) = host.into_parts();
         assert!(capture.began);
         assert_eq!(transport.sent, vec![Message::Enter { x: -1, y: 540 }]);
+    }
+
+    #[test]
+    fn two_finger_pinch_emits_ctrl_scroll_and_releases_control() {
+        let mut pinch = PinchZoomTracker::default();
+        assert!(pinch.down(1, 10_000, 10_000).is_empty());
+        assert!(pinch.down(2, 12_000, 10_000).is_empty());
+        assert_eq!(
+            pinch.motion(2, 15_000, 10_000),
+            vec![
+                WireInputEvent {
+                    event_type: 1,
+                    code: 29,
+                    value: 1,
+                },
+                WireInputEvent {
+                    event_type: 2,
+                    code: 11,
+                    value: 240,
+                },
+            ]
+        );
+        assert_eq!(
+            pinch.up(2),
+            vec![WireInputEvent {
+                event_type: 1,
+                code: 29,
+                value: 0,
+            }]
+        );
     }
 
     #[test]

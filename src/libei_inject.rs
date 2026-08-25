@@ -481,9 +481,9 @@ impl Sender {
                     return;
                 }
                 self.metadata.devices.push(device_metadata(device));
-                if self.pointer.is_none()
-                    && unsafe { ei_device_has_capability(device, CAP_POINTER) }
-                {
+                let has_pointer = unsafe { ei_device_has_capability(device, CAP_POINTER) };
+                let has_button = unsafe { ei_device_has_capability(device, CAP_BUTTON) };
+                if self.pointer.is_none() && has_pointer {
                     self.pointer = NonNull::new(unsafe { ei_device_ref(device) });
                 }
                 if self.keyboard.is_none()
@@ -491,9 +491,14 @@ impl Sender {
                 {
                     self.keyboard = NonNull::new(unsafe { ei_device_ref(device) });
                 }
-                if self.button.is_none() && unsafe { ei_device_has_capability(device, CAP_BUTTON) }
-                {
-                    self.button = NonNull::new(unsafe { ei_device_ref(device) });
+                // KDE exposes an absolute touch-capable device before the
+                // relative pointer device, and both advertise buttons. A
+                // button sent through the absolute device does not join the
+                // relative pointer focus stream, so its click is ignored.
+                // Keep that device as a fallback, but upgrade to a button
+                // device that also has relative-pointer capability.
+                if has_button && (self.button.is_none() || has_pointer) {
+                    replace_slot(&mut self.button, device);
                 }
                 if self.scroll.is_none() && unsafe { ei_device_has_capability(device, CAP_SCROLL) }
                 {
@@ -730,6 +735,18 @@ fn release_slot(slot: &mut Option<NonNull<EiDevice>>) {
     if let Some(device) = slot.take() {
         unsafe { ei_device_unref(device.as_ptr()) };
     }
+}
+
+fn replace_slot(slot: &mut Option<NonNull<EiDevice>>, device: *mut EiDevice) {
+    let Some(device) = NonNull::new(unsafe { ei_device_ref(device) }) else {
+        return;
+    };
+    if slot.is_some_and(|current| current == device) {
+        unsafe { ei_device_unref(device.as_ptr()) };
+        return;
+    }
+    release_slot(slot);
+    *slot = Some(device);
 }
 
 fn capabilities(mut has: impl FnMut(c_int) -> bool) -> Vec<&'static str> {
