@@ -483,6 +483,7 @@ impl Sender {
                 self.metadata.devices.push(device_metadata(device));
                 let has_pointer = unsafe { ei_device_has_capability(device, CAP_POINTER) };
                 let has_button = unsafe { ei_device_has_capability(device, CAP_BUTTON) };
+                let has_scroll = unsafe { ei_device_has_capability(device, CAP_SCROLL) };
                 if self.pointer.is_none() && has_pointer {
                     self.pointer = NonNull::new(unsafe { ei_device_ref(device) });
                 }
@@ -500,9 +501,11 @@ impl Sender {
                 if has_button && (self.button.is_none() || has_pointer) {
                     replace_slot(&mut self.button, device);
                 }
-                if self.scroll.is_none() && unsafe { ei_device_has_capability(device, CAP_SCROLL) }
-                {
-                    self.scroll = NonNull::new(unsafe { ei_device_ref(device) });
+                // Scroll must use the same relative device as pointer motion
+                // so Ctrl+scroll is delivered to the window under the remote
+                // cursor. The absolute touch device is a fallback only.
+                if has_scroll && (self.scroll.is_none() || has_pointer) {
+                    replace_slot(&mut self.scroll, device);
                 }
                 if self.touch.is_none() && unsafe { ei_device_has_capability(device, CAP_TOUCH) } {
                     self.touch = NonNull::new(unsafe { ei_device_ref(device) });
