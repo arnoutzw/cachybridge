@@ -28,7 +28,7 @@ use crate::{
 pub struct RemoteDesktopInjector {
     session: crate::remote_spike::RemoteDesktopSession,
     entry: Option<Point>,
-    motion_rate: MotionRate,
+    injection_timing: FrameTiming,
 }
 
 /// Adapter from the reusable InputCapture session and typed libei receiver to
@@ -53,39 +53,139 @@ pub struct InputCaptureAdapter {
     /// InputCapture. Read the trackpad's multitouch stream directly so a
     /// pinch remains available while the pointer is on the paired desktop.
     raw_trackpad_pinch: Option<RawTrackpadPinchCapture>,
-    motion_rate: MotionRate,
+    capture_timing: FrameTiming,
     pending: VecDeque<CapturedInput>,
 }
 
-/// One-second moving report used to distinguish compositor capture cadence
-/// from network/injection issues in a real seamless session.
+/// Rolling frame-time report for the actual input stream. This follows the
+/// same convention as game frame diagnostics: cadence, latest, average,
+/// percentiles, and two useful jank thresholds are reported once per second.
 #[derive(Debug)]
-struct MotionRate {
+struct FrameTiming {
     label: &'static str,
     window_started: Instant,
-    samples: u64,
+    last_sample: Option<Instant>,
+    intervals_ms: VecDeque<f64>,
+    events: u64,
 }
 
-impl MotionRate {
+impl FrameTiming {
+    const HISTORY: usize = 240;
+
     fn new(label: &'static str) -> Self {
         Self {
             label,
             window_started: Instant::now(),
-            samples: 0,
+            last_sample: None,
+            intervals_ms: VecDeque::with_capacity(Self::HISTORY),
+            events: 0,
         }
     }
 
     fn record(&mut self) {
-        self.samples += 1;
-        let elapsed = self.window_started.elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            eprintln!(
-                "motion {}: {:.1} paired samples/s",
-                self.label,
-                self.samples as f64 / elapsed.as_secs_f64()
+        let now = Instant::now();
+        if let Some(previous) = self.last_sample.replace(now) {
+            push_timing_sample(
+                &mut self.intervals_ms,
+                now.duration_since(previous).as_secs_f64() * 1_000.0,
+                Self::HISTORY,
             );
-            self.window_started = Instant::now();
-            self.samples = 0;
+        }
+        self.events += 1;
+        let elapsed = self.window_started.elapsed();
+        if elapsed >= Duration::from_secs(1) && !self.intervals_ms.is_empty() {
+            let summary = TimingSummary::from_samples(&self.intervals_ms);
+            eprintln!(
+                "diagnostics {}: rate={:.1}Hz frame_ms latest={:.2} avg={:.2} p50={:.2} p95={:.2} p99={:.2} max={:.2} jank>8.33ms={} jank>16.67ms={} samples={}",
+                self.label,
+                self.events as f64 / elapsed.as_secs_f64(),
+                summary.latest,
+                summary.average,
+                summary.p50,
+                summary.p95,
+                summary.p99,
+                summary.max,
+                summary.jank_120,
+                summary.jank_60,
+                self.intervals_ms.len(),
+            );
+            self.window_started = now;
+            self.events = 0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimingSummary {
+    latest: f64,
+    average: f64,
+    p50: f64,
+    p95: f64,
+    p99: f64,
+    max: f64,
+    jank_120: usize,
+    jank_60: usize,
+}
+
+impl TimingSummary {
+    fn from_samples(samples: &VecDeque<f64>) -> Self {
+        let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+        sorted.sort_by(f64::total_cmp);
+        let percentile =
+            |percent: f64| sorted[((sorted.len() - 1) as f64 * percent).round() as usize];
+        Self {
+            latest: *samples.back().expect("non-empty timing history"),
+            average: sorted.iter().sum::<f64>() / sorted.len() as f64,
+            p50: percentile(0.50),
+            p95: percentile(0.95),
+            p99: percentile(0.99),
+            max: *sorted.last().expect("non-empty timing history"),
+            jank_120: sorted.iter().filter(|&&ms| ms > 8.33).count(),
+            jank_60: sorted.iter().filter(|&&ms| ms > 16.67).count(),
+        }
+    }
+}
+
+fn push_timing_sample(samples: &mut VecDeque<f64>, sample_ms: f64, limit: usize) {
+    if samples.len() == limit {
+        samples.pop_front();
+    }
+    samples.push_back(sample_ms);
+}
+
+#[derive(Debug)]
+struct LatencyTiming {
+    samples_ms: VecDeque<f64>,
+    last_report: Instant,
+}
+
+impl LatencyTiming {
+    fn new() -> Self {
+        Self {
+            samples_ms: VecDeque::with_capacity(FrameTiming::HISTORY),
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, duration: Duration) {
+        push_timing_sample(
+            &mut self.samples_ms,
+            duration.as_secs_f64() * 1_000.0,
+            FrameTiming::HISTORY,
+        );
+        if self.last_report.elapsed() >= Duration::from_secs(1) {
+            let summary = TimingSummary::from_samples(&self.samples_ms);
+            eprintln!(
+                "diagnostics round_trip: latest={:.2}ms avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms samples={}",
+                summary.latest,
+                summary.average,
+                summary.p50,
+                summary.p95,
+                summary.p99,
+                summary.max,
+                self.samples_ms.len(),
+            );
+            self.last_report = Instant::now();
         }
     }
 }
@@ -524,7 +624,7 @@ impl InputCaptureAdapter {
             smooth_scroll_axes: (false, false),
             pinch_zoom: PinchZoomTracker::default(),
             raw_trackpad_pinch: Self::open_raw_trackpad(),
-            motion_rate: MotionRate::new("capture"),
+            capture_timing: FrameTiming::new("capture"),
             pending: VecDeque::new(),
         })
     }
@@ -547,7 +647,7 @@ impl InputCaptureAdapter {
             smooth_scroll_axes: (false, false),
             pinch_zoom: PinchZoomTracker::default(),
             raw_trackpad_pinch: Self::open_raw_trackpad(),
-            motion_rate: MotionRate::new("capture"),
+            capture_timing: FrameTiming::new("capture"),
             pending: VecDeque::new(),
         })
     }
@@ -591,9 +691,16 @@ impl InputCaptureAdapter {
     fn flush_motion(&mut self) {
         let (dx, dy) = std::mem::take(&mut self.pending_motion);
         if dx != 0 || dy != 0 {
-            self.motion_rate.record();
             self.pending.push_back(CapturedInput::Motion { dx, dy });
         }
+    }
+
+    fn take_pending(&mut self) -> Option<CapturedInput> {
+        let input = self.pending.pop_front();
+        if input.is_some() {
+            self.capture_timing.record();
+        }
+        input
     }
 
     fn drain_batch(&mut self, batch: crate::libei_capture::DispatchBatch) -> io::Result<()> {
@@ -773,13 +880,13 @@ impl CaptureBackend for InputCaptureAdapter {
     }
 
     fn next_input(&mut self, timeout: Duration) -> io::Result<Option<CapturedInput>> {
-        if let Some(event) = self.pending.pop_front() {
+        if let Some(event) = self.take_pending() {
             return Ok(Some(event));
         }
         if let Some(trackpad) = &mut self.raw_trackpad_pinch {
             self.pending
                 .extend(trackpad.drain()?.into_iter().map(CapturedInput::Event));
-            if let Some(event) = self.pending.pop_front() {
+            if let Some(event) = self.take_pending() {
                 return Ok(Some(event));
             }
         }
@@ -793,22 +900,17 @@ impl CaptureBackend for InputCaptureAdapter {
             }
             Some(_) | None => {}
         }
-        // Poll the direct trackpad stream at 125 Hz. Portal pointer capture
-        // remains the authority for regular input; this shorter poll only
-        // prevents a compositor-consumed pinch from waiting for the 1 s
-        // heartbeat interval.
-        let timeout = if self.raw_trackpad_pinch.is_some() {
-            timeout.min(RAW_TRACKPAD_POLL_INTERVAL)
-        } else {
-            timeout
-        };
+        // A bounded 125 Hz wake-up also services peer control/RTT replies in
+        // the idle case. Heartbeats themselves remain rate-limited, so this
+        // does not add wire traffic while the pointer is still.
+        let timeout = timeout.min(RAW_TRACKPAD_POLL_INTERVAL);
         let batch = self.session.dispatch_events(timeout)?;
         self.drain_batch(batch)?;
         if let Some(trackpad) = &mut self.raw_trackpad_pinch {
             self.pending
                 .extend(trackpad.drain()?.into_iter().map(CapturedInput::Event));
         }
-        Ok(self.pending.pop_front())
+        Ok(self.take_pending())
     }
 
     fn return_to_local(&mut self, restore: Point) -> io::Result<()> {
@@ -966,7 +1068,7 @@ impl RemoteDesktopInjector {
         Ok(Self {
             session: crate::remote_spike::RemoteDesktopSession::start()?,
             entry: None,
-            motion_rate: MotionRate::new("injection"),
+            injection_timing: FrameTiming::new("injection"),
         })
     }
 
@@ -978,7 +1080,7 @@ impl RemoteDesktopInjector {
                 persistence,
             )?,
             entry: None,
-            motion_rate: MotionRate::new("injection"),
+            injection_timing: FrameTiming::new("injection"),
         })
     }
 
@@ -1009,7 +1111,7 @@ impl InjectBackend for RemoteDesktopInjector {
 
     fn inject_motion(&mut self, dx: i32, dy: i32) -> io::Result<()> {
         self.session.inject_relative(f64::from(dx), f64::from(dy))?;
-        self.motion_rate.record();
+        self.injection_timing.record();
         Ok(())
     }
 
@@ -1026,7 +1128,7 @@ impl InjectBackend for RemoteDesktopInjector {
         const REL_HWHEEL_HI_RES: u16 = 12;
         const BTN_MOUSE_FIRST: u16 = 0x110;
 
-        match (event.event_type, event.code) {
+        let result = match (event.event_type, event.code) {
             (EV_SYN, SYN_REPORT) => Ok(()),
             (EV_REL, REL_X) => self.session.inject_relative(f64::from(event.value), 0.0),
             (EV_REL, REL_Y) => self.session.inject_relative(0.0, f64::from(event.value)),
@@ -1053,16 +1155,24 @@ impl InjectBackend for RemoteDesktopInjector {
                     event.event_type, event.code
                 ),
             )),
+        };
+        if result.is_ok() {
+            self.injection_timing.record();
         }
+        result
     }
 
     fn inject_touch(&mut self, event: WireTouchEvent) -> io::Result<()> {
-        match event.phase {
+        let result = match event.phase {
             TouchPhase::Down => self.session.inject_touch_down(event.id, event.x, event.y),
             TouchPhase::Motion => self.session.inject_touch_motion(event.id, event.x, event.y),
             TouchPhase::Up => self.session.inject_touch_up(event.id, false),
             TouchPhase::Cancel => self.session.inject_touch_up(event.id, true),
+        };
+        if result.is_ok() {
+            self.injection_timing.record();
         }
+        result
     }
 
     fn release_all(&mut self) -> io::Result<()> {
@@ -1145,6 +1255,10 @@ pub struct SeamlessHost<C, T> {
     capture: C,
     transport: T,
     last_peer_activity: Instant,
+    last_latency_probe: Instant,
+    next_probe_sequence: u32,
+    pending_probe: Option<(u32, Instant)>,
+    round_trip_timing: LatencyTiming,
 }
 
 impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
@@ -1154,6 +1268,10 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
             capture,
             transport,
             last_peer_activity: Instant::now(),
+            last_latency_probe: Instant::now(),
+            next_probe_sequence: 0,
+            pending_probe: None,
+            round_trip_timing: LatencyTiming::new(),
         }
     }
 
@@ -1216,6 +1334,7 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
         if !matches!(self.controller.state(), HandoffState::RemoteActive { .. }) {
             return Ok(());
         }
+        self.maybe_send_latency_probe()?;
         match self.capture.next_input(timeout)? {
             Some(input) => {
                 // An ExitRequest may have arrived while EIS dispatch waited.
@@ -1261,6 +1380,14 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
         };
         match message {
             Message::Heartbeat => Ok(()),
+            Message::DiagnosticPong { sequence } => {
+                if let Some((expected, sent_at)) = self.pending_probe.take() {
+                    if sequence == expected {
+                        self.round_trip_timing.record(sent_at.elapsed());
+                    }
+                }
+                Ok(())
+            }
             Message::ExitRequest { edge, x, y } => {
                 let edge = match edge {
                     WireEdge::Left => crate::handoff::Edge::Left,
@@ -1290,6 +1417,21 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
                 Err(SeamlessError::UnexpectedControl(message))
             }
         }
+    }
+
+    fn maybe_send_latency_probe(&mut self) -> Result<(), SeamlessError> {
+        if self.pending_probe.is_some()
+            || self.last_latency_probe.elapsed() < Duration::from_secs(1)
+        {
+            return Ok(());
+        }
+        self.next_probe_sequence = self.next_probe_sequence.wrapping_add(1);
+        let sequence = self.next_probe_sequence;
+        self.transport.send(Message::DiagnosticPing { sequence })?;
+        let now = Instant::now();
+        self.pending_probe = Some((sequence, now));
+        self.last_latency_probe = now;
+        Ok(())
     }
 
     pub fn into_parts(self) -> (C, T) {
@@ -1404,6 +1546,10 @@ impl<I: InjectBackend, T: MessageTransport> SeamlessClient<I, T> {
                 }
             }
             Message::Heartbeat => Ok(()),
+            Message::DiagnosticPing { sequence } => {
+                self.transport.send(Message::DiagnosticPong { sequence })?;
+                Ok(())
+            }
             Message::HandoffRelease => {
                 self.close()?;
                 self.return_pending = false;

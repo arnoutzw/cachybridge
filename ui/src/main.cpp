@@ -31,6 +31,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSet>
 #include <QSettings>
@@ -1709,18 +1710,81 @@ public:
         clipboardLayout->addWidget(refreshClipboard);
         showClipboard();
 
+        auto *diagnosticsViewer = new QWidget;
+        auto *diagnosticsLayout = new QVBoxLayout(diagnosticsViewer);
+        diagnosticsLayout->setContentsMargins(12, 12, 12, 12);
+        auto *diagnosticsHeading = new QLabel(QStringLiteral("Live input performance"));
+        QFont diagnosticsFont = diagnosticsHeading->font();
+        diagnosticsFont.setBold(true);
+        diagnosticsHeading->setFont(diagnosticsFont);
+        auto *diagnosticsHint = new QLabel(QStringLiteral(
+            "Frame time is the interval between captured or injected input frames. "
+            "p95/p99 expose rare stutters; jank counts frames slower than 120 Hz (8.33 ms) and 60 Hz (16.67 ms). "
+            "Round trip is an authenticated host → client → host probe, including both apps' event-loop scheduling."));
+        diagnosticsHint->setWordWrap(true);
+        auto *diagnosticsOutput = new QPlainTextEdit;
+        diagnosticsOutput->setReadOnly(true);
+        diagnosticsOutput->setMinimumHeight(220);
+        diagnosticsOutput->setPlaceholderText(QStringLiteral(
+            "Connect the iMacs and move the pointer on the remote screen to collect performance samples."));
+        auto *refreshDiagnostics = new QPushButton(QStringLiteral("Refresh diagnostics"));
+        diagnosticsLayout->addWidget(diagnosticsHeading);
+        diagnosticsLayout->addWidget(diagnosticsHint);
+        diagnosticsLayout->addWidget(diagnosticsOutput, 1);
+        diagnosticsLayout->addWidget(refreshDiagnostics, 0, Qt::AlignLeft);
+
+        const QString diagnosticsUnit = role_ == MachineRole::Host
+            ? QStringLiteral("cachybridge-seamless-host")
+            : QStringLiteral("cachybridge-seamless-client");
+        auto *diagnosticsProcess = new QProcess(this);
+        const auto refreshPerformanceDiagnostics = [diagnosticsProcess, diagnosticsOutput, diagnosticsUnit] {
+            if (diagnosticsProcess->state() != QProcess::NotRunning)
+                return;
+            diagnosticsProcess->start(QStringLiteral("journalctl"), {
+                QStringLiteral("--user"), QStringLiteral("-u"), diagnosticsUnit,
+                QStringLiteral("--since"), QStringLiteral("-90 seconds ago"),
+                QStringLiteral("--no-pager"), QStringLiteral("-o"), QStringLiteral("cat")});
+        };
+        connect(diagnosticsProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+            [diagnosticsProcess, diagnosticsOutput](int exitCode, QProcess::ExitStatus status) {
+                const QString output = QString::fromUtf8(diagnosticsProcess->readAllStandardOutput());
+                QStringList rows;
+                for (const QString &line : output.split(u'\n', Qt::SkipEmptyParts)) {
+                    if (line.contains(QStringLiteral("diagnostics ")))
+                        rows << line.trimmed();
+                }
+                if (status != QProcess::NormalExit || exitCode != 0) {
+                    diagnosticsOutput->setPlainText(QStringLiteral("Could not read the local CachyBridge diagnostics journal."));
+                } else if (rows.isEmpty()) {
+                    diagnosticsOutput->setPlainText(QStringLiteral(
+                        "No samples yet. Connect, move the pointer to the other iMac, then return here. "
+                        "The host also reports an RTT sample roughly once per second while input is active."));
+                } else {
+                    diagnosticsOutput->setPlainText(rows.sliced(std::max<qsizetype>(0, rows.size() - 12)).join(u'\n'));
+                    diagnosticsOutput->verticalScrollBar()->setValue(diagnosticsOutput->verticalScrollBar()->maximum());
+                }
+            });
+        connect(refreshDiagnostics, &QPushButton::clicked, this, refreshPerformanceDiagnostics);
+        auto *diagnosticsTimer = new QTimer(this);
+        diagnosticsTimer->setInterval(1000);
+        connect(diagnosticsTimer, &QTimer::timeout, this, refreshPerformanceDiagnostics);
+        diagnosticsTimer->start();
+
         auto *layout = new QVBoxLayout(this);
         layout->addWidget(roleBanner);
         auto *tabs = new QTabWidget;
         tabs->addTab(easyPairing, QStringLiteral("Connect"));
         tabs->addTab(clipboardViewer, QStringLiteral("Clipboard"));
         tabs->addTab(placementBox, QStringLiteral("Displays"));
+        tabs->addTab(diagnosticsViewer, QStringLiteral("Diagnostics"));
         connect(tabs, &QTabWidget::currentChanged, this,
-            [tabs, clipboardViewer, placementBox, showClipboard, fetchClientDisplay](int) {
+            [tabs, clipboardViewer, placementBox, diagnosticsViewer, showClipboard, fetchClientDisplay, refreshPerformanceDiagnostics](int) {
             if (tabs->currentWidget() == clipboardViewer)
                 showClipboard();
             if (tabs->currentWidget() == placementBox)
                 fetchClientDisplay();
+            if (tabs->currentWidget() == diagnosticsViewer)
+                refreshPerformanceDiagnostics();
         });
 
         layout->addWidget(tabs, 1);

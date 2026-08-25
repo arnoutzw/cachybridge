@@ -1928,6 +1928,12 @@ fn run_client(
                 event_count += 1;
             }
             Ok(Message::Heartbeat) => {}
+            Ok(Message::DiagnosticPing { sequence }) => {
+                if let Err(error) = connection.send(Message::DiagnosticPong { sequence }) {
+                    break Err(Box::new(error));
+                }
+            }
+            Ok(Message::DiagnosticPong { .. }) => {}
             Ok(Message::ReleaseAll | Message::HandoffRelease) => {
                 if let Err(error) = sink.release_all() {
                     break Err(Box::new(error));

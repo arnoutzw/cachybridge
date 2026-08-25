@@ -2,11 +2,11 @@
 
 use thiserror::Error;
 
-/// Version 5 adds normalized multi-touch contacts. Normalization lets a
+/// Version 6 adds authenticated ping/pong latency probes. Version 5 added normalized multi-touch contacts. Normalization lets a
 /// physical touch surface such as Magic Trackpad map safely to the remote
 /// compositor's touch region without assuming matching dimensions.
 /// Older handoff implementations fail closed during decoding.
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 pub const MAX_FRAME_PAYLOAD: usize = 64;
 pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000;
 pub const PEER_TIMEOUT_MS: u64 = 5_000;
@@ -22,6 +22,8 @@ const KIND_HANDOFF_RELEASE: u8 = 8;
 const KIND_EXIT_REQUEST: u8 = 9;
 const KIND_POINTER_MOTION: u8 = 10;
 const KIND_TOUCH: u8 = 11;
+const KIND_DIAGNOSTIC_PING: u8 = 12;
+const KIND_DIAGNOSTIC_PONG: u8 = 13;
 const INPUT_PAYLOAD_LEN: usize = 8;
 const ENTER_PAYLOAD_LEN: usize = 8;
 const EXIT_REQUEST_PAYLOAD_LEN: usize = 9;
@@ -99,6 +101,16 @@ pub enum Message {
         dy: i32,
     },
     Touch(WireTouchEvent),
+    /// A low-rate authenticated probe from the host. It carries no input and
+    /// has no effect on the active handoff.
+    DiagnosticPing {
+        sequence: u32,
+    },
+    /// The controlled peer returns the exact probe after it has serviced its
+    /// event loop, yielding a realistic network + scheduling round trip.
+    DiagnosticPong {
+        sequence: u32,
+    },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -170,6 +182,14 @@ pub fn encode_frame(message: Message) -> Vec<u8> {
             payload[5..7].copy_from_slice(&event.x.to_be_bytes());
             payload[7..9].copy_from_slice(&event.y.to_be_bytes());
             (KIND_TOUCH, payload.to_vec())
+        }
+        Message::DiagnosticPing { sequence } | Message::DiagnosticPong { sequence } => {
+            let kind = match message {
+                Message::DiagnosticPing { .. } => KIND_DIAGNOSTIC_PING,
+                Message::DiagnosticPong { .. } => KIND_DIAGNOSTIC_PONG,
+                _ => unreachable!(),
+            };
+            (kind, sequence.to_be_bytes().to_vec())
         }
     };
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -249,12 +269,22 @@ pub fn decode_frame(frame: &[u8]) -> Result<Message, ProtocolError> {
                 y: u16::from_be_bytes([payload[7], payload[8]]),
             }))
         }
+        KIND_DIAGNOSTIC_PING | KIND_DIAGNOSTIC_PONG if payload.len() == 4 => {
+            let sequence = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            Ok(if kind == KIND_DIAGNOSTIC_PING {
+                Message::DiagnosticPing { sequence }
+            } else {
+                Message::DiagnosticPong { sequence }
+            })
+        }
         KIND_INPUT | KIND_HEARTBEAT | KIND_RELEASE_ALL | KIND_GOODBYE | KIND_ENTER
         | KIND_ENTER_ACK | KIND_ENTER_REJECTED | KIND_HANDOFF_RELEASE | KIND_EXIT_REQUEST
-        | KIND_POINTER_MOTION | KIND_TOUCH => Err(ProtocolError::InvalidPayloadLength {
-            kind,
-            actual: payload.len(),
-        }),
+        | KIND_POINTER_MOTION | KIND_TOUCH | KIND_DIAGNOSTIC_PING | KIND_DIAGNOSTIC_PONG => {
+            Err(ProtocolError::InvalidPayloadLength {
+                kind,
+                actual: payload.len(),
+            })
+        }
         _ => Err(ProtocolError::UnknownKind(kind)),
     }
 }
@@ -287,6 +317,16 @@ mod tests {
             decode_frame(&encode_frame(Message::Goodbye)),
             Ok(Message::Goodbye)
         );
+    }
+
+    #[test]
+    fn diagnostics_probe_round_trips_without_input_payload() {
+        for message in [
+            Message::DiagnosticPing { sequence: 41 },
+            Message::DiagnosticPong { sequence: 41 },
+        ] {
+            assert_eq!(decode_frame(&encode_frame(message)), Ok(message));
+        }
     }
 
     #[test]
