@@ -1819,56 +1819,39 @@ public:
         diagnosticsLayout->addWidget(diagnosticsStatus);
         diagnosticsLayout->addWidget(refreshDiagnostics, 0, Qt::AlignLeft);
 
-        const QString diagnosticsUnit = role_ == MachineRole::Host
-            ? QStringLiteral("cachybridge-seamless-host")
-            : QStringLiteral("cachybridge-seamless-client");
-        auto *diagnosticsProcess = new QProcess(this);
-        const auto refreshPerformanceDiagnostics = [diagnosticsProcess, diagnosticsUnit] {
-            if (diagnosticsProcess->state() != QProcess::NotRunning)
+        const QString diagnosticsFile = QDir(qEnvironmentVariable("XDG_RUNTIME_DIR"))
+            .filePath(role_ == MachineRole::Host
+                ? QStringLiteral("cachybridge/frame-times-capture.csv")
+                : QStringLiteral("cachybridge/frame-times-injection.csv"));
+        const auto refreshPerformanceDiagnostics = [frameTimePlot, diagnosticsStatus, diagnosticsFile] {
+            QFile file(diagnosticsFile);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                frameTimePlot->setSamples({});
+                diagnosticsStatus->setText(QStringLiteral(
+                    "Waiting for active remote input to collect frame-time samples."));
                 return;
-            diagnosticsProcess->start(QStringLiteral("journalctl"), {
-                QStringLiteral("--user"), QStringLiteral("-u"), diagnosticsUnit,
-                QStringLiteral("--since"), QStringLiteral("90 seconds ago"),
-                QStringLiteral("--no-pager"), QStringLiteral("-o"), QStringLiteral("cat")});
+            }
+            QVector<double> samples;
+            for (const QStringView value : QStringView(QString::fromUtf8(file.readAll())).split(u',')) {
+                bool valid = false;
+                const double milliseconds = value.trimmed().toDouble(&valid);
+                if (valid && milliseconds >= 0.0)
+                    samples << milliseconds;
+            }
+            if (samples.isEmpty()) {
+                frameTimePlot->setSamples({});
+                diagnosticsStatus->setText(QStringLiteral(
+                    "Waiting for active remote input to collect frame-time samples."));
+                return;
+            }
+            const int sampleCount = samples.size();
+            frameTimePlot->setSamples(std::move(samples));
+            diagnosticsStatus->setText(QStringLiteral(
+                "Live at 60 Hz · rolling window of %1 active input frames").arg(sampleCount));
         };
-        connect(diagnosticsProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-            [diagnosticsProcess, frameTimePlot, diagnosticsStatus](int exitCode, QProcess::ExitStatus status) {
-                const QString output = QString::fromUtf8(diagnosticsProcess->readAllStandardOutput());
-                QVector<double> samples;
-                for (const QString &line : output.split(u'\n', Qt::SkipEmptyParts)) {
-                    const int marker = line.indexOf(QStringLiteral("diagnostics_series "));
-                    if (marker < 0)
-                        continue;
-                    const int colon = line.indexOf(u':', marker);
-                    if (colon < 0)
-                        continue;
-                    QVector<double> parsed;
-                    for (const QStringView value : QStringView(line).sliced(colon + 1).split(u',')) {
-                        bool valid = false;
-                        const double milliseconds = value.trimmed().toDouble(&valid);
-                        if (valid && milliseconds >= 0.0)
-                            parsed << milliseconds;
-                    }
-                    if (!parsed.isEmpty())
-                        samples = std::move(parsed);
-                }
-                if (status != QProcess::NormalExit || exitCode != 0) {
-                    frameTimePlot->setSamples({});
-                    diagnosticsStatus->setText(QStringLiteral("Local diagnostics are temporarily unavailable."));
-                } else if (samples.isEmpty()) {
-                    frameTimePlot->setSamples({});
-                    diagnosticsStatus->setText(QStringLiteral(
-                        "Waiting for active remote input to collect frame-time samples."));
-                } else {
-                    const int sampleCount = samples.size();
-                    frameTimePlot->setSamples(std::move(samples));
-                    diagnosticsStatus->setText(QStringLiteral(
-                        "Live rolling window · %1 active input frames").arg(sampleCount));
-                }
-            });
         connect(refreshDiagnostics, &QPushButton::clicked, this, refreshPerformanceDiagnostics);
         auto *diagnosticsTimer = new QTimer(this);
-        diagnosticsTimer->setInterval(1000);
+        diagnosticsTimer->setInterval(16);
         connect(diagnosticsTimer, &QTimer::timeout, this, refreshPerformanceDiagnostics);
         diagnosticsTimer->start();
 

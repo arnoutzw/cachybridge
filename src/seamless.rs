@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io,
     os::fd::AsRawFd,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -68,6 +69,8 @@ struct FrameTiming {
     intervals_ms: VecDeque<f64>,
     events: u64,
     idle_gaps: u64,
+    series_path: Option<PathBuf>,
+    last_series_publish: Instant,
 }
 
 impl FrameTiming {
@@ -81,6 +84,8 @@ impl FrameTiming {
             intervals_ms: VecDeque::with_capacity(Self::HISTORY),
             events: 0,
             idle_gaps: 0,
+            series_path: diagnostics_series_path(label),
+            last_series_publish: Instant::now(),
         }
     }
 
@@ -97,6 +102,12 @@ impl FrameTiming {
             }
         }
         self.events += 1;
+        if !self.intervals_ms.is_empty()
+            && self.last_series_publish.elapsed() >= Duration::from_millis(16)
+        {
+            self.publish_series();
+            self.last_series_publish = now;
+        }
         let elapsed = self.window_started.elapsed();
         if elapsed >= Duration::from_secs(1) && !self.intervals_ms.is_empty() {
             let summary = TimingSummary::from_samples(&self.intervals_ms);
@@ -115,20 +126,40 @@ impl FrameTiming {
                 self.idle_gaps,
                 self.intervals_ms.len(),
             );
-            let series = self
-                .intervals_ms
-                .iter()
-                .map(|milliseconds| format!("{milliseconds:.2}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            // The setup UI consumes this compact rolling series to draw an
-            // XY chart. It is emitted once per second, never once per input.
-            eprintln!("diagnostics_series {}: {series}", self.label);
             self.window_started = now;
             self.events = 0;
             self.idle_gaps = 0;
         }
     }
+
+    fn publish_series(&self) {
+        let Some(path) = &self.series_path else {
+            return;
+        };
+        let series = self
+            .intervals_ms
+            .iter()
+            .map(|milliseconds| format!("{milliseconds:.3}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let temporary = path.with_extension("tmp");
+        if std::fs::write(&temporary, series)
+            .and_then(|()| std::fs::rename(&temporary, path))
+            .is_err()
+        {
+            // Performance telemetry is optional and must never interfere with
+            // input forwarding if the runtime directory vanishes mid-session.
+        }
+    }
+}
+
+fn diagnostics_series_path(label: &str) -> Option<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let directory = PathBuf::from(runtime).join("cachybridge");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return None;
+    }
+    Some(directory.join(format!("frame-times-{label}.csv")))
 }
 
 #[derive(Debug, Clone, Copy)]
