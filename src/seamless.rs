@@ -115,6 +115,15 @@ impl FrameTiming {
                 self.idle_gaps,
                 self.intervals_ms.len(),
             );
+            let series = self
+                .intervals_ms
+                .iter()
+                .map(|milliseconds| format!("{milliseconds:.2}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // The setup UI consumes this compact rolling series to draw an
+            // XY chart. It is emitted once per second, never once per input.
+            eprintln!("diagnostics_series {}: {series}", self.label);
             self.window_started = now;
             self.events = 0;
             self.idle_gaps = 0;

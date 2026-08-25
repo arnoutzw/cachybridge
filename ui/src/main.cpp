@@ -27,6 +27,8 @@
 #include <QImage>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QPainter>
+#include <QPaintEvent>
 #include <QProcess>
 #include <QPushButton>
 #include <QSaveFile>
@@ -45,6 +47,7 @@
 #include <QTimer>
 #include <QUdpSocket>
 #include <QVBoxLayout>
+#include <QVector>
 #include <QWidget>
 
 #include <algorithm>
@@ -968,6 +971,90 @@ private:
     QString lastHealthyProbe_;
 };
 
+class FrameTimePlot final : public QWidget {
+public:
+    explicit FrameTimePlot(QWidget *parent = nullptr) : QWidget(parent) {
+        setMinimumHeight(280);
+    }
+
+    void setSamples(QVector<double> samples) {
+        samples_ = std::move(samples);
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QRectF bounds = rect().adjusted(52, 26, -16, -38);
+        const QColor foreground = palette().color(QPalette::Text);
+        const QColor border = palette().color(QPalette::Mid);
+        const QColor surface = palette().color(QPalette::AlternateBase);
+        painter.fillRect(rect(), surface);
+        painter.setPen(QPen(border, 1));
+        painter.drawRect(bounds);
+        painter.setPen(foreground);
+        painter.drawText(QRectF(8, 4, width() - 16, 20), Qt::AlignLeft | Qt::AlignVCenter,
+            QStringLiteral("Frame time — latest active input frames"));
+        painter.drawText(QRectF(bounds.left(), bounds.bottom() + 8, bounds.width(), 20),
+            Qt::AlignCenter, QStringLiteral("Time →"));
+        if (samples_.isEmpty()) {
+            painter.drawText(bounds, Qt::AlignCenter,
+                QStringLiteral("Waiting for active remote input…"));
+            return;
+        }
+
+        QVector<double> ordered = samples_;
+        std::sort(ordered.begin(), ordered.end());
+        const double p95 = ordered.at(static_cast<int>((ordered.size() - 1) * 0.95));
+        const double maximum = ordered.last();
+        // Keep normal 120/60 Hz detail visible. Rare spikes are marked at the
+        // chart ceiling instead of flattening the entire live trace.
+        const double yMaximum = std::max(20.0, std::min(50.0, std::ceil(p95 / 5.0) * 5.0));
+        const auto yFor = [&bounds, yMaximum](double milliseconds) {
+            return bounds.bottom() - std::min(milliseconds, yMaximum) / yMaximum * bounds.height();
+        };
+        const auto xFor = [&bounds, count = samples_.size()](int index) {
+            return count <= 1 ? bounds.left()
+                : bounds.left() + static_cast<double>(index) / (count - 1) * bounds.width();
+        };
+
+        painter.setPen(QPen(border, 1, Qt::DashLine));
+        for (double milliseconds : {8.33, 16.67}) {
+            const double y = yFor(milliseconds);
+            painter.drawLine(QPointF(bounds.left(), y), QPointF(bounds.right(), y));
+            painter.drawText(QRectF(2, y - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
+                QString::number(milliseconds, 'f', 1));
+        }
+        painter.setPen(QPen(border, 1));
+        painter.drawText(QRectF(2, bounds.top() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
+            QString::number(yMaximum, 'f', 0));
+        painter.drawText(QRectF(2, bounds.bottom() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
+            QStringLiteral("0"));
+
+        QPainterPath path;
+        for (int index = 0; index < samples_.size(); ++index) {
+            const QPointF point(xFor(index), yFor(samples_.at(index)));
+            if (index == 0) path.moveTo(point); else path.lineTo(point);
+        }
+        painter.setPen(QPen(palette().color(QPalette::Highlight), 1.6));
+        painter.drawPath(path);
+        painter.setPen(QPen(QColor(QStringLiteral("#dc2626")), 3));
+        for (int index = 0; index < samples_.size(); ++index) {
+            if (samples_.at(index) > 16.67)
+                painter.drawPoint(QPointF(xFor(index), yFor(samples_.at(index))));
+        }
+        painter.setPen(foreground);
+        painter.drawText(QRectF(bounds.left(), bounds.top() - 1, bounds.width(), 20),
+            Qt::AlignRight | Qt::AlignVCenter,
+            QStringLiteral("latest %1 ms · p95 %2 ms · max %3 ms")
+                .arg(samples_.last(), 0, 'f', 2).arg(p95, 0, 'f', 2).arg(maximum, 0, 'f', 2));
+    }
+
+private:
+    QVector<double> samples_;
+};
+
 class SetupWindow final : public QWidget {
 public:
     explicit SetupWindow(std::unique_ptr<SetupStore> store, MachineRole role)
@@ -1718,26 +1805,25 @@ public:
         diagnosticsFont.setBold(true);
         diagnosticsHeading->setFont(diagnosticsFont);
         auto *diagnosticsHint = new QLabel(QStringLiteral(
-            "Frame time is the interval between captured or injected input frames. "
-            "p95/p99 expose rare stutters; jank counts frames slower than 120 Hz (8.33 ms) and 60 Hz (16.67 ms). "
-            "Round trip is an authenticated host → client → host probe, including both apps' event-loop scheduling."));
+            "Time runs left to right; frame time is in milliseconds. The dashed guides mark 120 Hz (8.33 ms) and 60 Hz (16.67 ms). "
+            "Red points are slower than 60 Hz. Idle pauses are excluded."));
         diagnosticsHint->setWordWrap(true);
-        auto *diagnosticsOutput = new QPlainTextEdit;
-        diagnosticsOutput->setReadOnly(true);
-        diagnosticsOutput->setMinimumHeight(220);
-        diagnosticsOutput->setPlaceholderText(QStringLiteral(
-            "Connect the iMacs and move the pointer on the remote screen to collect performance samples."));
+        auto *frameTimePlot = new FrameTimePlot;
+        auto *diagnosticsStatus = new QLabel(QStringLiteral(
+            "Waiting for active remote input to collect frame-time samples."));
+        diagnosticsStatus->setWordWrap(true);
         auto *refreshDiagnostics = new QPushButton(QStringLiteral("Refresh diagnostics"));
         diagnosticsLayout->addWidget(diagnosticsHeading);
         diagnosticsLayout->addWidget(diagnosticsHint);
-        diagnosticsLayout->addWidget(diagnosticsOutput, 1);
+        diagnosticsLayout->addWidget(frameTimePlot, 1);
+        diagnosticsLayout->addWidget(diagnosticsStatus);
         diagnosticsLayout->addWidget(refreshDiagnostics, 0, Qt::AlignLeft);
 
         const QString diagnosticsUnit = role_ == MachineRole::Host
             ? QStringLiteral("cachybridge-seamless-host")
             : QStringLiteral("cachybridge-seamless-client");
         auto *diagnosticsProcess = new QProcess(this);
-        const auto refreshPerformanceDiagnostics = [diagnosticsProcess, diagnosticsOutput, diagnosticsUnit] {
+        const auto refreshPerformanceDiagnostics = [diagnosticsProcess, diagnosticsUnit] {
             if (diagnosticsProcess->state() != QProcess::NotRunning)
                 return;
             diagnosticsProcess->start(QStringLiteral("journalctl"), {
@@ -1746,22 +1832,38 @@ public:
                 QStringLiteral("--no-pager"), QStringLiteral("-o"), QStringLiteral("cat")});
         };
         connect(diagnosticsProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
-            [diagnosticsProcess, diagnosticsOutput](int exitCode, QProcess::ExitStatus status) {
+            [diagnosticsProcess, frameTimePlot, diagnosticsStatus](int exitCode, QProcess::ExitStatus status) {
                 const QString output = QString::fromUtf8(diagnosticsProcess->readAllStandardOutput());
-                QStringList rows;
+                QVector<double> samples;
                 for (const QString &line : output.split(u'\n', Qt::SkipEmptyParts)) {
-                    if (line.contains(QStringLiteral("diagnostics ")))
-                        rows << line.trimmed();
+                    const int marker = line.indexOf(QStringLiteral("diagnostics_series "));
+                    if (marker < 0)
+                        continue;
+                    const int colon = line.indexOf(u':', marker);
+                    if (colon < 0)
+                        continue;
+                    QVector<double> parsed;
+                    for (const QStringView value : QStringView(line).sliced(colon + 1).split(u',')) {
+                        bool valid = false;
+                        const double milliseconds = value.trimmed().toDouble(&valid);
+                        if (valid && milliseconds >= 0.0)
+                            parsed << milliseconds;
+                    }
+                    if (!parsed.isEmpty())
+                        samples = std::move(parsed);
                 }
                 if (status != QProcess::NormalExit || exitCode != 0) {
-                    diagnosticsOutput->setPlainText(QStringLiteral("Could not read the local CachyBridge diagnostics journal."));
-                } else if (rows.isEmpty()) {
-                    diagnosticsOutput->setPlainText(QStringLiteral(
-                        "No samples yet. Connect, move the pointer to the other iMac, then return here. "
-                        "The host also reports an RTT sample roughly once per second while input is active."));
+                    frameTimePlot->setSamples({});
+                    diagnosticsStatus->setText(QStringLiteral("Local diagnostics are temporarily unavailable."));
+                } else if (samples.isEmpty()) {
+                    frameTimePlot->setSamples({});
+                    diagnosticsStatus->setText(QStringLiteral(
+                        "Waiting for active remote input to collect frame-time samples."));
                 } else {
-                    diagnosticsOutput->setPlainText(rows.sliced(std::max<qsizetype>(0, rows.size() - 12)).join(u'\n'));
-                    diagnosticsOutput->verticalScrollBar()->setValue(diagnosticsOutput->verticalScrollBar()->maximum());
+                    const int sampleCount = samples.size();
+                    frameTimePlot->setSamples(std::move(samples));
+                    diagnosticsStatus->setText(QStringLiteral(
+                        "Live rolling window · %1 active input frames").arg(sampleCount));
                 }
             });
         connect(refreshDiagnostics, &QPushButton::clicked, this, refreshPerformanceDiagnostics);
