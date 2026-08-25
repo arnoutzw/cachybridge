@@ -2,6 +2,21 @@
 
 CachyBridge shares one Bluetooth mouse and keyboard between two CachyOS/KDE Wayland desktops on the same LAN. Its seamless mode uses the desktop portals: crossing the host's configured outer edge captures input and sends it over an authenticated encrypted connection; the client injects it with RemoteDesktop, and its return edge releases the host capture.
 
+## 1.0 release
+
+CachyBridge 1.0 is the first complete two-iMac release: guided five-character
+pairing, automatic LAN discovery, draggable display placement, encrypted KVM,
+clipboard and file transfer, and login restore. Each iMac can have its own
+**This iMac** label; it defaults to the system hostname but does not rename the
+operating system.
+
+![Host connection setup](docs/screenshots/setup-host.png)
+
+The display arrangement reads the client resolution from the paired iMac, so
+the relative placement controls the real cursor handoff boundary.
+
+![Display placement setup](docs/screenshots/setup-displays.png)
+
 When both KDE portals expose the `TOUCHSCREEN` capability, CachyBridge also
 forwards multi-contact touch input from a Magic Trackpad 2. Contacts are
 normalized to the physical trackpad surface, encrypted, and mapped to the
