@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QAbstractItemView>
+#include <QCheckBox>
 #include <QCommandLineParser>
 #include <QDateTime>
 #include <QDialog>
@@ -30,6 +31,7 @@
 #include <QPushButton>
 #include <QSaveFile>
 #include <QScreen>
+#include <QSignalBlocker>
 #include <QSet>
 #include <QSettings>
 #include <QSpinBox>
@@ -123,6 +125,42 @@ QString bundledTrayPath() {
     if (QFileInfo(adjacent).isExecutable())
         return adjacent;
     return QStandardPaths::findExecutable(QStringLiteral("cachybridge-tray"));
+}
+
+QString managedAutostartPath() {
+    const QString config = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
+    return config.isEmpty() ? QString() : config + QStringLiteral("/autostart/cachybridge-tray.desktop");
+}
+
+bool setLoginAutostart(bool enabled) {
+    const QString path = managedAutostartPath();
+    if (path.isEmpty())
+        return false;
+    if (!enabled) {
+        QFile file(path);
+        return !file.exists() || file.remove();
+    }
+    const QString tray = bundledTrayPath();
+    if (tray.isEmpty() || !QDir().mkpath(QFileInfo(path).dir().absolutePath()))
+        return false;
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+    const QByteArray desktop = QStringLiteral(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=CachyBridge Tray\n"
+        "Comment=Restore CachyBridge after login\n"
+        "Exec=%1\n"
+        "Icon=input-mouse\n"
+        "Terminal=false\n"
+        "X-KDE-autostart-after=panel\n"
+        "X-CachyBridge-Managed=true\n")
+        .arg(tray).toUtf8();
+    if (file.write(desktop) != desktop.size())
+        return false;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return file.commit();
 }
 
 void ensureTrayUtility() {
@@ -1397,6 +1435,24 @@ public:
             QMessageBox::information(this, QStringLiteral("This iMac is unpaired"),
                 QStringLiteral("Sharing has stopped and the local CachyBridge pairing was removed."));
         });
+        auto *startAtLogin = new QCheckBox(QStringLiteral("Start CachyBridge at login"));
+        startAtLogin->setToolTip(QStringLiteral(
+            "Starts the tray utility and restores the saved pairing after you sign in."));
+        QSettings startupSettings;
+        startAtLogin->setChecked(startupSettings.value(QStringLiteral("startup/enabled"), false).toBool());
+        connect(startAtLogin, &QCheckBox::toggled, this, [startAtLogin](bool enabled) {
+            if (!setLoginAutostart(enabled)) {
+                QSignalBlocker blocker(startAtLogin);
+                startAtLogin->setChecked(!enabled);
+                QMessageBox::warning(startAtLogin, QStringLiteral("Could not update start at login"),
+                    QStringLiteral("CachyBridge could not update its desktop autostart entry."));
+                return;
+            }
+            QSettings settings;
+            settings.setValue(QStringLiteral("startup/enabled"), enabled);
+            settings.sync();
+        });
+        easyLayout->addWidget(startAtLogin);
         easyLayout->addWidget(unpairButton, 0, Qt::AlignRight);
 
         auto *placementBox = new QWidget;
