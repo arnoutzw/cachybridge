@@ -1742,7 +1742,7 @@ public:
                 return;
             diagnosticsProcess->start(QStringLiteral("journalctl"), {
                 QStringLiteral("--user"), QStringLiteral("-u"), diagnosticsUnit,
-                QStringLiteral("--since"), QStringLiteral("-90 seconds ago"),
+                QStringLiteral("--since"), QStringLiteral("90 seconds ago"),
                 QStringLiteral("--no-pager"), QStringLiteral("-o"), QStringLiteral("cat")});
         };
         connect(diagnosticsProcess, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,

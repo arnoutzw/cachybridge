@@ -67,6 +67,7 @@ struct FrameTiming {
     last_sample: Option<Instant>,
     intervals_ms: VecDeque<f64>,
     events: u64,
+    idle_gaps: u64,
 }
 
 impl FrameTiming {
@@ -79,24 +80,28 @@ impl FrameTiming {
             last_sample: None,
             intervals_ms: VecDeque::with_capacity(Self::HISTORY),
             events: 0,
+            idle_gaps: 0,
         }
     }
 
     fn record(&mut self) {
         let now = Instant::now();
         if let Some(previous) = self.last_sample.replace(now) {
-            push_timing_sample(
-                &mut self.intervals_ms,
-                now.duration_since(previous).as_secs_f64() * 1_000.0,
-                Self::HISTORY,
-            );
+            let interval_ms = now.duration_since(previous).as_secs_f64() * 1_000.0;
+            // A stopped pointer is not a dropped frame. Keep its return as an
+            // explicit idle gap and only percentile contiguous active input.
+            if interval_ms <= 250.0 {
+                push_timing_sample(&mut self.intervals_ms, interval_ms, Self::HISTORY);
+            } else {
+                self.idle_gaps += 1;
+            }
         }
         self.events += 1;
         let elapsed = self.window_started.elapsed();
         if elapsed >= Duration::from_secs(1) && !self.intervals_ms.is_empty() {
             let summary = TimingSummary::from_samples(&self.intervals_ms);
             eprintln!(
-                "diagnostics {}: rate={:.1}Hz frame_ms latest={:.2} avg={:.2} p50={:.2} p95={:.2} p99={:.2} max={:.2} jank>8.33ms={} jank>16.67ms={} samples={}",
+                "diagnostics {}: rate={:.1}Hz frame_ms latest={:.2} avg={:.2} p50={:.2} p95={:.2} p99={:.2} max={:.2} jank>8.33ms={} jank>16.67ms={} idle_gaps={} samples={}",
                 self.label,
                 self.events as f64 / elapsed.as_secs_f64(),
                 summary.latest,
@@ -107,10 +112,12 @@ impl FrameTiming {
                 summary.max,
                 summary.jank_120,
                 summary.jank_60,
+                self.idle_gaps,
                 self.intervals_ms.len(),
             );
             self.window_started = now;
             self.events = 0;
+            self.idle_gaps = 0;
         }
     }
 }
