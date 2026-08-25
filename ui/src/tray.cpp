@@ -125,9 +125,10 @@ public:
         item_.setIconByName(QStringLiteral("input-mouse"));
         item_.setToolTipTitle(QStringLiteral("CachyBridge"));
         item_.setToolTipSubTitle(QStringLiteral("Double-click to open setup"));
-        // Cover all normal application exits, including one initiated by the
-        // desktop shell. The explicit menu action below reaches this path too.
+        // KDE supplies the native Quit/Afsluiten action for the status item.
+        // Make that single action also close Setup and stop every session.
         connect(&application_, &QCoreApplication::aboutToQuit, this, [this] {
+            sendSetupCommand("quit");
             stopPairingAvailability();
             stopSharing();
         });
@@ -149,14 +150,6 @@ public:
             QSettings settings = setupSettings();
             settings.setValue(QStringLiteral("startup/enabled"), enabled);
             settings.sync();
-        });
-        menu->addSeparator();
-        menu->addAction(QStringLiteral("Quit CachyBridge"), this, [this] {
-            // The setup window may have been opened from the Start Menu, not
-            // by this tray process. Use the local control socket so Quit is a
-            // single, predictable action in either case.
-            sendSetupCommand("quit");
-            application_.quit();
         });
         item_.setContextMenu(menu);
 
