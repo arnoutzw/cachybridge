@@ -447,7 +447,9 @@ QString endpointAddress(const QString &endpoint) {
 // Compare addresses, rather than full endpoints, so the nearby list can show
 // the actual live connection state without exposing any pairing secret.
 QSet<QString> connectedCachyBridgeAddresses() {
-    const QString ss = QStandardPaths::findExecutable(QStringLiteral("ss"));
+    QString ss = QStandardPaths::findExecutable(QStringLiteral("ss"));
+    if (ss.isEmpty() && QFileInfo::exists(QStringLiteral("/usr/bin/ss")))
+        ss = QStringLiteral("/usr/bin/ss");
     if (ss.isEmpty())
         return {};
 
@@ -1175,8 +1177,13 @@ public:
                 QString name = client.sliced(separator + 1).trimmed();
                 name.remove(QStringLiteral("CachyBridge "), Qt::CaseInsensitive);
                 const bool connected = isAddressConnected(endpoint, connectedAddresses);
-                const QString peerId = pairingError.isEmpty()
+                QString peerId = pairingError.isEmpty()
                     ? peerIdForClientEndpoint(peers, endpoint) : QString();
+                // Discovery only advertises a temporary pairing endpoint. If
+                // there is one saved client, it is unambiguously that client
+                // even when the discovery metadata is stale or incomplete.
+                if (peerId.isEmpty() && pairingError.isEmpty() && peers.size() == 1)
+                    peerId = peers.first().section(u'\t', 0, 0);
                 const bool paired = !peerId.isEmpty();
                 const bool current = paired && peerId.compare(currentPeerId, Qt::CaseInsensitive) == 0;
                 const QString state = connected
@@ -1269,6 +1276,53 @@ public:
         hostConnectLayout->addWidget(pairingEntry);
         hostConnectLayout->addWidget(connectionEntry);
         easyLayout->addWidget(hostConnectPanel_);
+
+        auto *clientHostCard = new QWidget;
+        clientHostCard->setStyleSheet(QStringLiteral(
+            "QWidget { background: palette(alternate-base); border-radius: 6px; } "
+            "QLabel { padding: 0; }"));
+        auto *clientHostLayout = new QVBoxLayout(clientHostCard);
+        clientHostLayout->setContentsMargins(12, 10, 12, 10);
+        auto *clientHostTitle = new QLabel(QStringLiteral("Host"));
+        QFont clientHostTitleFont = clientHostTitle->font();
+        clientHostTitleFont.setBold(true);
+        clientHostTitle->setFont(clientHostTitleFont);
+        auto *clientHostDetails = new QLabel;
+        auto *clientHostState = new QLabel;
+        clientHostLayout->addWidget(clientHostTitle);
+        clientHostLayout->addWidget(clientHostDetails);
+        clientHostLayout->addWidget(clientHostState);
+        const auto refreshClientHost = [this, clientHostDetails, clientHostState] {
+            QString error;
+            const QStringList peers = store_->configuredPeers(&error);
+            if (!error.isEmpty() || peers.isEmpty()) {
+                clientHostDetails->setText(QStringLiteral("No host is paired yet."));
+                clientHostState->clear();
+                return;
+            }
+            QSettings settings;
+            const QString currentPeerId = activePeerId_.isEmpty()
+                ? settings.value(QStringLiteral("startup/peer-id")).toString()
+                : activePeerId_;
+            QString peer;
+            for (const QString &candidate : peers) {
+                if (candidate.section(u'\t', 0, 0).compare(currentPeerId, Qt::CaseInsensitive) == 0) {
+                    peer = candidate;
+                    break;
+                }
+            }
+            if (peer.isEmpty())
+                peer = peers.first();
+            const QString hostName = peer.section(u'\t', 1, 1);
+            const QString hostEndpoint = peer.section(u'\t', 3, 3);
+            const bool connected = isAddressConnected(hostEndpoint, connectedCachyBridgeAddresses());
+            clientHostDetails->setText(QStringLiteral("%1  ·  %2")
+                .arg(hostName, endpointAddress(hostEndpoint)));
+            clientHostState->setText(connected
+                ? QStringLiteral("Connected") : QStringLiteral("Waiting for host"));
+            clientHostState->setStyleSheet(connected
+                ? QStringLiteral("color: #15803d;") : QStringLiteral("color: palette(mid);"));
+        };
         if (role_ == MachineRole::Host) {
             QTimer::singleShot(0, this, refreshNearbyClients);
             // A client Setup window starts its tray utility asynchronously.
@@ -1280,8 +1334,14 @@ public:
                 [nearbyClients, refreshNearbyClients] {
                     if (!nearbyClients->currentItem())
                         refreshNearbyClients();
-                });
+            });
             discoveryRefresh->start();
+        } else {
+            QTimer::singleShot(0, this, refreshClientHost);
+            auto *hostRefresh = new QTimer(this);
+            hostRefresh->setInterval(2000);
+            connect(hostRefresh, &QTimer::timeout, this, refreshClientHost);
+            hostRefresh->start();
         }
 
         auto *unpairButton = new QPushButton(QStringLiteral("Unpair…"));
@@ -1557,6 +1617,7 @@ public:
         firewallButton->setVisible(role_ == MachineRole::Client && !firewallPermissionConfigured());
         clipboardSupport->setVisible(!clipboardToolsAvailable());
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
+        clientHostCard->setVisible(role_ == MachineRole::Client);
         clientCodeCard_->setVisible(false);
         pairingStatus_->setText(role_ == MachineRole::Host
             ? QStringLiteral("Select a nearby client iMac to request its pairing code.")
