@@ -1277,27 +1277,23 @@ public:
         hostConnectLayout->addWidget(connectionEntry);
         easyLayout->addWidget(hostConnectPanel_);
 
-        auto *clientHostCard = new QWidget;
-        clientHostCard->setStyleSheet(QStringLiteral(
-            "QWidget { background: palette(alternate-base); border-radius: 6px; } "
-            "QLabel { padding: 0; }"));
-        auto *clientHostLayout = new QVBoxLayout(clientHostCard);
-        clientHostLayout->setContentsMargins(12, 10, 12, 10);
-        auto *clientHostTitle = new QLabel(QStringLiteral("Host"));
-        QFont clientHostTitleFont = clientHostTitle->font();
-        clientHostTitleFont.setBold(true);
-        clientHostTitle->setFont(clientHostTitleFont);
-        auto *clientHostDetails = new QLabel;
-        auto *clientHostState = new QLabel;
-        clientHostLayout->addWidget(clientHostTitle);
-        clientHostLayout->addWidget(clientHostDetails);
-        clientHostLayout->addWidget(clientHostState);
-        const auto refreshClientHost = [this, clientHostDetails, clientHostState] {
+        auto *clientHostPanel = new QWidget;
+        auto *clientHostLayout = new QVBoxLayout(clientHostPanel);
+        clientHostLayout->setContentsMargins(0, 0, 0, 0);
+        auto *knownHosts = new QListWidget;
+        knownHosts->setMinimumHeight(62);
+        knownHosts->setMaximumHeight(100);
+        knownHosts->setFocusPolicy(Qt::NoFocus);
+        knownHosts->setStyleSheet(QStringLiteral(
+            "QListWidget { border: 1px solid palette(mid); border-radius: 6px; }"));
+        clientHostLayout->addWidget(new QLabel(QStringLiteral("Host iMac")));
+        clientHostLayout->addWidget(knownHosts);
+        const auto refreshClientHost = [this, knownHosts] {
             QString error;
             const QStringList peers = store_->configuredPeers(&error);
+            knownHosts->clear();
             if (!error.isEmpty() || peers.isEmpty()) {
-                clientHostDetails->setText(QStringLiteral("No host is paired yet."));
-                clientHostState->clear();
+                new QListWidgetItem(QStringLiteral("No host is paired yet."), knownHosts);
                 return;
             }
             QSettings settings;
@@ -1316,12 +1312,30 @@ public:
             const QString hostName = peer.section(u'\t', 1, 1);
             const QString hostEndpoint = peer.section(u'\t', 3, 3);
             const bool connected = isAddressConnected(hostEndpoint, connectedCachyBridgeAddresses());
-            clientHostDetails->setText(QStringLiteral("%1  ·  %2")
-                .arg(hostName, endpointAddress(hostEndpoint)));
-            clientHostState->setText(connected
-                ? QStringLiteral("Connected") : QStringLiteral("Waiting for host"));
-            clientHostState->setStyleSheet(connected
-                ? QStringLiteral("color: #15803d;") : QStringLiteral("color: palette(mid);"));
+            auto *item = new QListWidgetItem(knownHosts);
+            item->setSizeHint(QSize(0, 54));
+            auto *row = new QWidget;
+            auto *rowLayout = new QHBoxLayout(row);
+            rowLayout->setContentsMargins(10, 5, 10, 5);
+            auto *details = new QVBoxLayout;
+            details->setSpacing(0);
+            auto *nameLabel = new QLabel(hostName);
+            QFont nameFont = nameLabel->font();
+            nameFont.setBold(true);
+            nameLabel->setFont(nameFont);
+            auto *endpointLabel = new QLabel(endpointAddress(hostEndpoint));
+            endpointLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+            details->addWidget(nameLabel);
+            details->addWidget(endpointLabel);
+            auto *state = new QLabel(connected ? QStringLiteral("CONNECTED") : QStringLiteral("PAIRED"));
+            state->setStyleSheet(QStringLiteral(
+                "QLabel { color: %1; background: %2; padding: 3px 6px; "
+                "border-radius: 4px; font-weight: 600; }")
+                .arg(connected ? QStringLiteral("#15803d") : QStringLiteral("#1d4ed8"),
+                     connected ? QStringLiteral("#dcfce7") : QStringLiteral("#dbeafe")));
+            rowLayout->addLayout(details, 1);
+            rowLayout->addWidget(state);
+            knownHosts->setItemWidget(item, row);
         };
         if (role_ == MachineRole::Host) {
             QTimer::singleShot(0, this, refreshNearbyClients);
@@ -1617,7 +1631,7 @@ public:
         firewallButton->setVisible(role_ == MachineRole::Client && !firewallPermissionConfigured());
         clipboardSupport->setVisible(!clipboardToolsAvailable());
         hostConnectPanel_->setVisible(role_ == MachineRole::Host);
-        clientHostCard->setVisible(role_ == MachineRole::Client);
+        clientHostPanel->setVisible(role_ == MachineRole::Client);
         clientCodeCard_->setVisible(false);
         pairingStatus_->setText(role_ == MachineRole::Host
             ? QStringLiteral("Select a nearby client iMac to request its pairing code.")
