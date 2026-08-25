@@ -515,15 +515,24 @@ QSet<QString> connectedCachyBridgeAddresses() {
         .split(u'\n', Qt::SkipEmptyParts);
     for (const QString &line : lines) {
         const QStringList fields = line.simplified().split(u' ', Qt::SkipEmptyParts);
+        QStringList endpoints;
+        bool bridgeConnection = false;
         for (const QString &field : fields) {
             const int separator = field.lastIndexOf(u':');
             if (separator <= 0)
                 continue;
+            endpoints << field;
             bool portIsValid = false;
             const quint16 port = field.sliced(separator + 1).toUShort(&portIsValid);
-            if (!portIsValid || (port != 45231 && port != 45234))
-                continue;
-            const QString address = endpointAddress(field);
+            bridgeConnection |= portIsValid && (port == 45231 || port == 45234);
+        }
+        // On the client, ss reports 45231/45234 on the *local* endpoint.
+        // Record both ends of a known CachyBridge connection so each role can
+        // match its paired peer's LAN address.
+        if (!bridgeConnection)
+            continue;
+        for (const QString &endpoint : endpoints) {
+            const QString address = endpointAddress(endpoint);
             QHostAddress parsedAddress;
             if (parsedAddress.setAddress(address))
                 addresses.insert(parsedAddress.toString());
