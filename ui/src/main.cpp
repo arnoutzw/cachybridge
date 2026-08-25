@@ -58,12 +58,26 @@ QString setupControlServerName() {
         .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
 }
 
+QString trayControlServerName() {
+    return QStringLiteral("cachybridge-tray-control-%1")
+        .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
+}
+
 bool sendSetupCommand(const QByteArray &command) {
     QLocalSocket socket;
     socket.connectToServer(setupControlServerName());
     if (!socket.waitForConnected(300))
         return false;
     socket.write(command);
+    return socket.waitForBytesWritten(300);
+}
+
+bool trayIsRunning() {
+    QLocalSocket socket;
+    socket.connectToServer(trayControlServerName());
+    if (!socket.waitForConnected(300))
+        return false;
+    socket.write("ping");
     return socket.waitForBytesWritten(300);
 }
 
@@ -102,6 +116,22 @@ QString bundledCliPath() {
     if (!discovered.isEmpty())
         return discovered;
     return adjacent;
+}
+
+QString bundledTrayPath() {
+    const QString adjacent = QCoreApplication::applicationDirPath()
+        + QStringLiteral("/cachybridge-tray");
+    if (QFileInfo(adjacent).isExecutable())
+        return adjacent;
+    return QStandardPaths::findExecutable(QStringLiteral("cachybridge-tray"));
+}
+
+void ensureTrayUtility() {
+    if (trayIsRunning())
+        return;
+    const QString tray = bundledTrayPath();
+    if (!tray.isEmpty())
+        QProcess::startDetached(tray, {});
 }
 
 QString clipboardToolPath(const QString &name) {
@@ -1134,8 +1164,20 @@ public:
         hostConnectLayout->addLayout(joinForm);
         hostConnectLayout->addWidget(joinButton);
         easyLayout->addWidget(hostConnectPanel_);
-        if (role_ == MachineRole::Host)
+        if (role_ == MachineRole::Host) {
             QTimer::singleShot(0, this, refreshNearbyClients);
+            // A client Setup window starts its tray utility asynchronously.
+            // Refresh idle lists so that client appears without requiring the
+            // host user to close/reopen this already-visible window.
+            auto *discoveryRefresh = new QTimer(this);
+            discoveryRefresh->setInterval(3000);
+            connect(discoveryRefresh, &QTimer::timeout, this,
+                [nearbyClients, refreshNearbyClients] {
+                    if (!nearbyClients->currentItem())
+                        refreshNearbyClients();
+                });
+            discoveryRefresh->start();
+        }
 
         auto *unpairButton = new QPushButton(QStringLiteral("Unpair this iMac"));
         unpairButton->setToolTip(QStringLiteral(
@@ -1654,6 +1696,10 @@ int main(int argc, char **argv) {
             role == MachineRole::Host ? QStringLiteral("host") : QStringLiteral("client"));
         settings.sync();
     }
+    // The Start Menu opens Setup directly. Keep the long-lived tray utility
+    // running alongside it: it owns discovery and makes the app reachable
+    // when Setup is closed.
+    ensureTrayUtility();
     SetupWindow window(std::make_unique<CliSetupStore>(
         parser.value(bridgeOption), parser.value(configOption)), role);
     activeSetupWindow = &window;

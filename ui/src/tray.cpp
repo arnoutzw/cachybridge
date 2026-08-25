@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QFont>
 #include <QLabel>
+#include <QLocalServer>
 #include <QLocalSocket>
 #include <QMenu>
 #include <QMessageBox>
@@ -25,6 +26,7 @@
 
 #include <KStatusNotifierItem>
 
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -37,9 +39,23 @@ QString setupControlServerName() {
         .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
 }
 
+QString trayControlServerName() {
+    return QStringLiteral("cachybridge-tray-control-%1")
+        .arg(qEnvironmentVariable("USER", QStringLiteral("local-user")));
+}
+
 bool sendSetupCommand(const QByteArray &command) {
     QLocalSocket socket;
     socket.connectToServer(setupControlServerName());
+    if (!socket.waitForConnected(300))
+        return false;
+    socket.write(command);
+    return socket.waitForBytesWritten(300);
+}
+
+bool sendTrayCommand(const QByteArray &command) {
+    QLocalSocket socket;
+    socket.connectToServer(trayControlServerName());
     if (!socket.waitForConnected(300))
         return false;
     socket.write(command);
@@ -178,9 +194,10 @@ private:
 
     void enableClientPairingDiscovery() {
         QSettings settings = setupSettings();
-        if (settings.value(QStringLiteral("startup/role")).toString() != QStringLiteral("client"))
-            return;
+        const QString configuredRole = settings.value(QStringLiteral("startup/role")).toString();
         const QString cli = bundledCliPath();
+        if (configuredRole != QStringLiteral("client") && !hasClientPeerRole(cli))
+            return;
         if (cli.isEmpty())
             return;
         pairingRequests_ = new QUdpSocket(this);
@@ -195,6 +212,22 @@ private:
         pairingAdvertiser_->start(cli, {QStringLiteral("pair-advertise"),
             QStringLiteral("--local-name"), QSysInfo::machineHostName(),
             QStringLiteral("--pairing-port"), QString::number(pairingPort)});
+    }
+
+    static bool hasClientPeerRole(const QString &cli) {
+        if (cli.isEmpty())
+            return false;
+        QProcess process;
+        process.start(cli, {QStringLiteral("peer-list")});
+        if (!process.waitForStarted() || !process.waitForFinished(2000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            return false;
+        }
+        const QStringList peers = QString::fromUtf8(process.readAllStandardOutput())
+            .split(u'\n', Qt::SkipEmptyParts);
+        return std::any_of(peers.cbegin(), peers.cend(), [](const QString &peer) {
+            return peer.section(u'\t', 2, 2) == QStringLiteral("right");
+        });
     }
 
     void stopPairingAvailability() {
@@ -410,6 +443,28 @@ int main(int argc, char **argv) {
     QCoreApplication::setApplicationName(QStringLiteral("CachyBridge"));
     QCoreApplication::setOrganizationName(QStringLiteral("CachyOS"));
     application.setQuitOnLastWindowClosed(false);
+
+    // Setup may start this utility on demand. Keep exactly one notifier icon
+    // and one UDP pairing responder per desktop session.
+    if (sendTrayCommand("ping"))
+        return 0;
+    QLocalServer::removeServer(trayControlServerName());
+    QLocalServer trayControl;
+    if (!trayControl.listen(trayControlServerName()))
+        return 1;
     CachyBridgeTray tray(application);
+    QObject::connect(&trayControl, &QLocalServer::newConnection, &application, [&trayControl] {
+        while (QLocalSocket *socket = trayControl.nextPendingConnection()) {
+            const auto reply = [socket] {
+                socket->readAll();
+                socket->write("ok");
+                socket->disconnectFromServer();
+                socket->deleteLater();
+            };
+            QObject::connect(socket, &QLocalSocket::readyRead, socket, reply);
+            if (socket->bytesAvailable() > 0)
+                reply();
+        }
+    });
     return application.exec();
 }

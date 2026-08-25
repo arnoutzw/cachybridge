@@ -233,7 +233,7 @@ fn start_session(persistence: PortalPersistence) -> RemoteResult<RemoteDesktopSe
     let select_response = wait_for_response(&mut select_signals, "SelectDevices")?;
     require_success("SelectDevices", select_response.code)?;
     println!(
-        "SelectDevices response: keyboard+pointer requested, persistence {}",
+        "SelectDevices response: keyboard+pointer+touchscreen requested, persistence {}",
         if persistence.is_enabled() {
             "enabled"
         } else {
