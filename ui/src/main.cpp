@@ -197,6 +197,18 @@ bool requestClientPairingCode(const QString &endpoint) {
     return socket.writeDatagram(request, address, port) == qint64(strlen(request));
 }
 
+bool requestClientReconnect(const QString &endpoint) {
+    const int separator = endpoint.lastIndexOf(u':');
+    if (separator <= 0)
+        return false;
+    QHostAddress address;
+    if (!address.setAddress(endpoint.left(separator)))
+        return false;
+    constexpr auto request = "CachyBridgeReconnect/1";
+    QUdpSocket socket;
+    return socket.writeDatagram(request, address, 45'232) == qint64(strlen(request));
+}
+
 struct SetupDraft {
     QString hostName;
     QString hostEndpoint;
@@ -1170,21 +1182,32 @@ public:
         pairingEntryLayout->addWidget(joinButton);
         connect(connectButton, &QPushButton::clicked, this, [this, connectButton] {
             const QString peerId = connectButton->property("peerId").toString();
-            if (peerId.isEmpty())
+            const QString endpoint = connectButton->property("endpoint").toString();
+            if (peerId.isEmpty() || endpoint.isEmpty())
                 return;
-            QSize remote;
-            const QString displayError = store_->clientDisplaySize(peerId, &remote);
-            if (displayError.isEmpty())
-                placementPreview_->setClientResolution(remote);
-            activePeerId_ = peerId;
-            const QString serviceError = startHostSession(peerId);
-            if (!serviceError.isEmpty()) {
-                pairingStatus_->setText(QStringLiteral("Could not start the connection: %1").arg(serviceError));
+            if (!requestClientReconnect(endpoint)) {
+                pairingStatus_->setText(QStringLiteral(
+                    "Could not contact the client tray. Open CachyBridge on the client, then try again."));
                 return;
             }
-            pairingStatus_->setText(displayError.isEmpty()
-                ? QStringLiteral("Connecting with the client’s current display size.")
-                : QStringLiteral("Connecting. Client display size will refresh when it is online."));
+            activePeerId_ = peerId;
+            connectButton->setEnabled(false);
+            pairingStatus_->setText(QStringLiteral("Starting the client, then connecting…"));
+            QTimer::singleShot(1200, this, [this, connectButton, peerId] {
+                QSize remote;
+                const QString displayError = store_->clientDisplaySize(peerId, &remote);
+                if (displayError.isEmpty())
+                    placementPreview_->setClientResolution(remote);
+                const QString serviceError = startHostSession(peerId);
+                connectButton->setEnabled(true);
+                if (!serviceError.isEmpty()) {
+                    pairingStatus_->setText(QStringLiteral("Could not start the connection: %1").arg(serviceError));
+                    return;
+                }
+                pairingStatus_->setText(displayError.isEmpty()
+                    ? QStringLiteral("Connecting with the client’s current display size.")
+                    : QStringLiteral("Connecting. Client display size will refresh when it is online."));
+            });
         });
         const auto refreshNearbyClients = [this, nearbyClients, joinButton] {
             QString error;
@@ -1280,6 +1303,7 @@ public:
                 const bool current = item->data(Qt::UserRole + 3).toBool();
                 if (paired) {
                     connectButton->setProperty("peerId", item->data(Qt::UserRole + 4));
+                    connectButton->setProperty("endpoint", item->data(Qt::UserRole));
                     connectButton->setText(connected
                         ? QStringLiteral("Reconnect client") : QStringLiteral("Connect client"));
                     connectionEntry->setVisible(true);

@@ -34,6 +34,7 @@ namespace {
 
 constexpr quint16 pairingPort = 45'232;
 const QByteArray pairingRequest = QByteArrayLiteral("CachyBridgePairRequest/1");
+const QByteArray reconnectRequest = QByteArrayLiteral("CachyBridgeReconnect/1");
 
 QString setupControlServerName() {
     return QStringLiteral("cachybridge-setup-control-%1")
@@ -248,6 +249,8 @@ private:
             const QNetworkDatagram request = pairingRequests_->receiveDatagram();
             if (request.data().trimmed() == pairingRequest)
                 showClientPairingCode();
+            else if (request.data().trimmed() == reconnectRequest)
+                restoreSavedSession();
         }
     }
 
