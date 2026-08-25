@@ -1270,7 +1270,7 @@ public:
                 item->setData(Qt::UserRole + 2, connected);
                 item->setData(Qt::UserRole + 3, current);
                 item->setData(Qt::UserRole + 4, peerId);
-                item->setSizeHint(QSize(0, paired ? 42 : 58));
+                item->setSizeHint(QSize(0, 54));
                 item->setToolTip(connected
                     ? QStringLiteral("A live CachyBridge KVM or clipboard connection is active.")
                     : (paired ? QStringLiteral("This iMac already has a saved CachyBridge pairing.")
@@ -1285,11 +1285,9 @@ public:
                 nameFont.setBold(true);
                 nameLabel->setFont(nameFont);
                 details->addWidget(nameLabel);
-                if (!paired) {
-                    auto *endpointLabel = new QLabel(endpoint);
-                    endpointLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
-                    details->addWidget(endpointLabel);
-                }
+                auto *endpointLabel = new QLabel(endpointAddress(endpoint));
+                endpointLabel->setStyleSheet(QStringLiteral("color: white;"));
+                details->addWidget(endpointLabel);
                 auto *stateLabel = new QLabel(state);
                 stateLabel->setStyleSheet(QStringLiteral(
                     "QLabel { %1 padding: 3px 6px; border-radius: 4px; font-weight: 600; }").arg(stateStyle));
@@ -1396,7 +1394,7 @@ public:
             nameFont.setBold(true);
             nameLabel->setFont(nameFont);
             auto *endpointLabel = new QLabel(endpointAddress(hostEndpoint));
-            endpointLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+            endpointLabel->setStyleSheet(QStringLiteral("color: white;"));
             details->addWidget(nameLabel);
             details->addWidget(endpointLabel);
             auto *state = new QLabel(connected ? QStringLiteral("CONNECTED") : QStringLiteral("PAIRED"));
