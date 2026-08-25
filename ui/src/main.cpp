@@ -506,6 +506,7 @@ public:
     virtual QString connectPairHost(const PairJoinDraft &draft, QString *peerId) = 0;
     virtual QStringList discoverPairClients(QString *error) = 0;
     virtual QStringList configuredPeers(QString *error) = 0;
+    virtual QString clientDisplaySize(const QString &peerId, QSize *size) = 0;
     virtual QString removePeer(const QString &peerId) = 0;
     virtual QString applyTopology(const QString &peerId, Placement placement) = 0;
     virtual QString ensureClientFirewall() = 0;
@@ -655,6 +656,29 @@ public:
         }
         return QString::fromUtf8(process.readAllStandardOutput())
             .split(u'\n', Qt::SkipEmptyParts);
+    }
+
+    QString clientDisplaySize(const QString &peerId, QSize *size) override {
+        QProcess process;
+        QStringList arguments{QStringLiteral("peer-display"), QStringLiteral("--peer"), peerId};
+        if (!configPath_.isEmpty()) arguments << QStringLiteral("--config") << configPath_;
+        process.start(cachybridge_, arguments);
+        if (!process.waitForStarted() || !process.waitForFinished(7000)
+            || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            const QString details = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            return details.isEmpty()
+                ? QStringLiteral("Could not read the paired client's display.") : details;
+        }
+        const QString reported = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        const QStringList dimensions = reported.split(u'x');
+        bool widthOk = false;
+        bool heightOk = false;
+        const int width = dimensions.value(0).toInt(&widthOk);
+        const int height = dimensions.value(1).toInt(&heightOk);
+        if (dimensions.size() != 2 || !widthOk || !heightOk || width <= 0 || height <= 0)
+            return QStringLiteral("The paired client returned an invalid display size.");
+        *size = QSize(width, height);
+        return {};
     }
 
     QString removePeer(const QString &peerId) override {
@@ -1059,6 +1083,12 @@ public:
         auto *pairingEntryLayout = new QVBoxLayout(pairingEntry);
         pairingEntryLayout->setContentsMargins(0, 0, 0, 0);
         pairingEntry->setVisible(false);
+        auto *connectionEntry = new QWidget;
+        auto *connectionLayout = new QVBoxLayout(connectionEntry);
+        connectionLayout->setContentsMargins(0, 0, 0, 0);
+        auto *connectButton = new QPushButton(QStringLiteral("Connect client"));
+        connectionLayout->addWidget(connectButton);
+        connectionEntry->setVisible(false);
         QFont pairingCodeFont = pairingCode_->font();
         pairingCodeFont.setPointSize(pairingCodeFont.pointSize() + 6);
         pairingCodeFont.setBold(true);
@@ -1098,6 +1128,24 @@ public:
         joinForm->addRow(QStringLiteral("Pairing code"), pairingCode_);
         pairingEntryLayout->addLayout(joinForm);
         pairingEntryLayout->addWidget(joinButton);
+        connect(connectButton, &QPushButton::clicked, this, [this, connectButton] {
+            const QString peerId = connectButton->property("peerId").toString();
+            if (peerId.isEmpty())
+                return;
+            QSize remote;
+            const QString displayError = store_->clientDisplaySize(peerId, &remote);
+            if (displayError.isEmpty())
+                placementPreview_->setClientResolution(remote);
+            activePeerId_ = peerId;
+            const QString serviceError = startHostSession(peerId);
+            if (!serviceError.isEmpty()) {
+                pairingStatus_->setText(QStringLiteral("Could not start the connection: %1").arg(serviceError));
+                return;
+            }
+            pairingStatus_->setText(displayError.isEmpty()
+                ? QStringLiteral("Connecting with the client’s current display size.")
+                : QStringLiteral("Connecting. Client display size will refresh when it is online."));
+        });
         const auto refreshNearbyClients = [this, nearbyClients, joinButton] {
             QString error;
             const QStringList clients = store_->discoverPairClients(&error);
@@ -1144,6 +1192,7 @@ public:
                 item->setData(Qt::UserRole + 1, paired);
                 item->setData(Qt::UserRole + 2, connected);
                 item->setData(Qt::UserRole + 3, current);
+                item->setData(Qt::UserRole + 4, peerId);
                 item->setSizeHint(QSize(0, paired ? 42 : 58));
                 item->setToolTip(connected
                     ? QStringLiteral("A live CachyBridge KVM or clipboard connection is active.")
@@ -1174,15 +1223,21 @@ public:
             pairingStatus_->clear();
         };
         connect(nearbyClients, &QListWidget::currentItemChanged, this,
-            [this, joinButton, pairingEntry](QListWidgetItem *item, QListWidgetItem *) {
+            [this, joinButton, pairingEntry, connectionEntry, connectButton]
+            (QListWidgetItem *item, QListWidgetItem *) {
                 joinButton->setEnabled(false);
                 pairingEntry->setVisible(false);
+                connectionEntry->setVisible(false);
                 if (!item)
                     return;
                 const bool paired = item->data(Qt::UserRole + 1).toBool();
                 const bool connected = item->data(Qt::UserRole + 2).toBool();
                 const bool current = item->data(Qt::UserRole + 3).toBool();
                 if (paired) {
+                    connectButton->setProperty("peerId", item->data(Qt::UserRole + 4));
+                    connectButton->setText(connected
+                        ? QStringLiteral("Reconnect client") : QStringLiteral("Connect client"));
+                    connectionEntry->setVisible(true);
                     pairingStatus_->setText(connected
                         ? QStringLiteral("This is %1 active CachyBridge connection.")
                             .arg(current ? QStringLiteral("the current") : QStringLiteral("a"))
@@ -1212,6 +1267,7 @@ public:
         hostConnectLayout->addWidget(new QLabel(QStringLiteral("Client iMacs")));
         hostConnectLayout->addWidget(nearbyClients);
         hostConnectLayout->addWidget(pairingEntry);
+        hostConnectLayout->addWidget(connectionEntry);
         easyLayout->addWidget(hostConnectPanel_);
         if (role_ == MachineRole::Host) {
             QTimer::singleShot(0, this, refreshNearbyClients);
@@ -1273,31 +1329,45 @@ public:
         auto *placementLayout = new QVBoxLayout(placementBox);
         placementLayout->setContentsMargins(12, 12, 12, 12);
         auto *hint = new QLabel(QStringLiteral(
-            "Drag the client tile left or right of the host. Tile sizes reflect the selected display resolutions. "
+            "Drag the client tile left or right of the host. The client display size is read from the paired iMac. "
             "Apply & reconnect updates both iMacs and re-arms the matching cursor edge."));
         hint->setWordWrap(true);
         placementPreview_ = new DisplayLayoutPreview;
-        clientWidth_ = new QSpinBox;
-        clientHeight_ = new QSpinBox;
-        for (auto *spin : {clientWidth_, clientHeight_}) {
-            spin->setRange(640, 16384);
-            spin->setSingleStep(16);
-            spin->setSuffix(QStringLiteral(" px"));
-        }
-        clientWidth_->setValue(placementPreview_->clientResolution().width());
-        clientHeight_->setValue(placementPreview_->clientResolution().height());
-        connect(clientWidth_, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
-            placementPreview_->setClientResolution({clientWidth_->value(), clientHeight_->value()});
-        });
-        connect(clientHeight_, qOverload<int>(&QSpinBox::valueChanged), this, [this] {
-            placementPreview_->setClientResolution({clientWidth_->value(), clientHeight_->value()});
-        });
-        auto *resolutionForm = new QFormLayout;
-        resolutionForm->addRow(QStringLiteral("Client width"), clientWidth_);
-        resolutionForm->addRow(QStringLiteral("Client height"), clientHeight_);
+        auto *clientDisplay = new QLabel(QStringLiteral("Client display: not fetched"));
+        clientDisplay->setStyleSheet(QStringLiteral("QLabel { color: palette(mid); }"));
+        auto *refreshClientDisplay = new QPushButton(QStringLiteral("Refresh client display"));
+        const auto fetchClientDisplay = [this, clientDisplay] {
+            QString peerId = activePeerId_;
+            if (peerId.isEmpty()) {
+                QSettings settings;
+                peerId = settings.value(QStringLiteral("startup/peer-id")).toString();
+            }
+            if (peerId.isEmpty()) {
+                QString error;
+                const QStringList peers = store_->configuredPeers(&error);
+                if (error.isEmpty() && peers.size() == 1)
+                    peerId = peers.first().section(u'\t', 0, 0);
+            }
+            if (peerId.isEmpty()) {
+                clientDisplay->setText(QStringLiteral("Client display: pair a client first"));
+                return;
+            }
+            QSize size;
+            const QString error = store_->clientDisplaySize(peerId, &size);
+            if (!error.isEmpty()) {
+                clientDisplay->setText(QStringLiteral("Client display: unavailable until the client connects"));
+                return;
+            }
+            activePeerId_ = peerId;
+            placementPreview_->setClientResolution(size);
+            clientDisplay->setText(QStringLiteral("Client display: %1 × %2 (live)")
+                .arg(size.width()).arg(size.height()));
+        };
+        connect(refreshClientDisplay, &QPushButton::clicked, this, fetchClientDisplay);
         placementLayout->addWidget(hint);
         placementLayout->addWidget(placementPreview_);
-        placementLayout->addLayout(resolutionForm);
+        placementLayout->addWidget(clientDisplay);
+        placementLayout->addWidget(refreshClientDisplay, 0, Qt::AlignLeft);
         auto *applyPlacement = new QPushButton(QStringLiteral("Apply & reconnect"));
         applyPlacement->setToolTip(QStringLiteral(
             "Saves this layout on both paired iMacs, releases active input, then starts a fresh host session."));
@@ -1454,9 +1524,12 @@ public:
         tabs->addTab(easyPairing, QStringLiteral("Connect"));
         tabs->addTab(clipboardViewer, QStringLiteral("Clipboard"));
         tabs->addTab(placementBox, QStringLiteral("Displays"));
-        connect(tabs, &QTabWidget::currentChanged, this, [tabs, clipboardViewer, showClipboard](int) {
+        connect(tabs, &QTabWidget::currentChanged, this,
+            [tabs, clipboardViewer, placementBox, showClipboard, fetchClientDisplay](int) {
             if (tabs->currentWidget() == clipboardViewer)
                 showClipboard();
+            if (tabs->currentWidget() == placementBox)
+                fetchClientDisplay();
         });
 
         layout->addWidget(tabs, 1);
@@ -1599,7 +1672,7 @@ private:
 
     QString startHostSession(const QString &peerId) const {
         const QSize local = logicalScreenSize();
-        const QSize remote(clientWidth_->value(), clientHeight_->value());
+        const QSize remote = placementPreview_->clientResolution();
         rememberStartupSession(peerId, MachineRole::Host, remote);
         return startUserService(QStringLiteral("cachybridge-seamless-host"), {
             QStringLiteral("seamless-host-config"), QStringLiteral("--peer"), peerId,
@@ -1652,8 +1725,6 @@ private:
     QLineEdit *pairingCode_ = nullptr;
     QLineEdit *pairingAddress_ = nullptr;
     DisplayLayoutPreview *placementPreview_ = nullptr;
-    QSpinBox *clientWidth_ = nullptr;
-    QSpinBox *clientHeight_ = nullptr;
     QLabel *pairingStatus_ = nullptr;
     QWidget *clientCodeCard_ = nullptr;
     QLabel *pairingCodeDisplay_ = nullptr;

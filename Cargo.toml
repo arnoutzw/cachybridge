@@ -12,6 +12,7 @@ hex = "0.4"
 rand = "0.8"
 snow = "0.9"
 spake2 = "0.4"
+serde_json = "1.0"
 thiserror = "1.0"
 zbus = "5.19"
 

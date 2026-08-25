@@ -30,6 +30,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
+    process::Command as ProcessCommand,
     sync::mpsc::{sync_channel, Receiver, TryRecvError},
     time::{Duration, Instant},
 };
@@ -230,6 +231,16 @@ enum Command {
         /// Position of the controlled client relative to this host.
         #[arg(long, value_enum)]
         placement: CliPlacement,
+        /// Use this configuration file instead of the normal per-user path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Read the paired client's current KDE logical display size over the
+    /// authenticated control channel.
+    PeerDisplay {
+        /// Configured 32-character peer ID.
+        #[arg(long)]
+        peer: String,
         /// Use this configuration file instead of the normal per-user path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -668,6 +679,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             placement,
             config: config_override,
         } => run_topology_apply(config_override, &peer, placement.into()),
+        Command::PeerDisplay {
+            peer,
+            config: config_override,
+        } => run_peer_display(config_override, &peer),
         Command::ClipboardSync {
             peer,
             config: config_override,
@@ -1068,6 +1083,79 @@ fn run_topology_apply(
     Ok(())
 }
 
+/// Reports the controlled desktop's logical size.  KDE's KScreen DBus-backed
+/// utility is used rather than a physical mode so the value matches Wayland
+/// cursor coordinates and portal zones (including display scaling).
+fn current_logical_screen_size() -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let output = ProcessCommand::new("kscreen-doctor")
+        .arg("--json")
+        .output()?;
+    if !output.status.success() {
+        return Err(
+            io::Error::other("kscreen-doctor could not read the current display layout").into(),
+        );
+    }
+    let layout: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let width = layout
+        .pointer("/screen/currentSize/width")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KScreen returned no screen width",
+            )
+        })?;
+    let height = layout
+        .pointer("/screen/currentSize/height")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KScreen returned no screen height",
+            )
+        })?;
+    Ok((width, height))
+}
+
+fn run_peer_display(
+    config_override: Option<PathBuf>,
+    peer_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, _, peer) = configured_peer(config_override, peer_id)?;
+    let control = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CONTROL_PORT);
+    let stream = TcpStream::connect_timeout(&control, Duration::from_secs(4))?;
+    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+    let mut connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
+    connection.send_payload(format!("CBDP1:{}", peer.id).as_bytes())?;
+    let reply = connection.receive_payload()?;
+    let reply = std::str::from_utf8(&reply)?;
+    let mut fields = reply.split(':');
+    let (Some(version), Some(width), Some(height), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid display response").into());
+    };
+    if version != "CBDP1" {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "unsupported display response").into(),
+        );
+    }
+    let width = width.parse::<u32>()?;
+    let height = height.parse::<u32>()?;
+    if width == 0 || height == 0 {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "invalid client display size").into(),
+        );
+    }
+    println!("{}x{}", width, height);
+    Ok(())
+}
+
 fn spawn_topology_control_listener(
     path: PathBuf,
     peer: config::PeerConfig,
@@ -1086,25 +1174,50 @@ fn spawn_topology_control_listener(
                         SecureConnection::connect(stream, Role::Client, peer.psk())?;
                     let payload = connection.receive_payload()?;
                     let request = std::str::from_utf8(&payload).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "invalid topology request")
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid control request")
                     })?;
                     let mut fields = request.split(':');
-                    let (Some(version), Some(id), Some(placement), None) =
-                        (fields.next(), fields.next(), fields.next(), fields.next())
-                    else {
+                    let (Some(version), Some(id)) = (fields.next(), fields.next()) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid control request",
+                        )
+                        .into());
+                    };
+                    if !id.eq_ignore_ascii_case(&peer.id) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "control peer mismatch",
+                        )
+                        .into());
+                    }
+                    if version == "CBDP1" {
+                        if fields.next().is_some() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid display request",
+                            )
+                            .into());
+                        }
+                        let (width, height) = current_logical_screen_size()?;
+                        return connection
+                            .send_payload(format!("CBDP1:{width}:{height}").as_bytes())
+                            .map_err(Into::into);
+                    }
+                    if version != "CBTO1" {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "unsupported control request",
+                        )
+                        .into());
+                    }
+                    let (Some(placement), None) = (fields.next(), fields.next()) else {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "invalid topology request",
                         )
                         .into());
                     };
-                    if version != "CBTO1" || !id.eq_ignore_ascii_case(&peer.id) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "topology peer mismatch",
-                        )
-                        .into());
-                    }
                     let host_placement = match placement {
                         "left" => config::RelativePlacement::Left,
                         "right" => config::RelativePlacement::Right,
