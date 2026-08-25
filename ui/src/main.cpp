@@ -82,6 +82,21 @@ bool trayIsRunning() {
     return socket.waitForBytesWritten(300);
 }
 
+bool sendTrayCommand(const QByteArray &command) {
+    QLocalSocket socket;
+    socket.connectToServer(trayControlServerName());
+    if (!socket.waitForConnected(300))
+        return false;
+    socket.write(command);
+    return socket.waitForBytesWritten(300);
+}
+
+QString configuredLocalName() {
+    QSettings settings(QStringLiteral("CachyOS"), QStringLiteral("CachyBridge Setup"));
+    const QString name = settings.value(QStringLiteral("identity/name")).toString().trimmed();
+    return name.isEmpty() ? QSysInfo::machineHostName() : name;
+}
+
 enum class Placement { Left, Right, Above, Below };
 enum class MachineRole { Host, Client };
 
@@ -969,7 +984,7 @@ public:
         roleBanner->setStyleSheet(QStringLiteral(
             "QLabel { padding: 2px 0; color: palette(highlight); }"));
 
-        localName_ = QSysInfo::machineHostName();
+        localName_ = configuredLocalName();
         pairingCode_ = new QLineEdit;
         pairingCode_->setPlaceholderText(QStringLiteral("ABCDE"));
         pairingCode_->setMaxLength(5);
@@ -979,6 +994,16 @@ public:
         auto *easyPairing = new QWidget;
         auto *easyLayout = new QVBoxLayout(easyPairing);
         easyLayout->setContentsMargins(12, 12, 12, 12);
+        localNameEditor_ = new QLineEdit(localName_);
+        localNameEditor_->setMaxLength(80);
+        localNameEditor_->setToolTip(QStringLiteral(
+            "A CachyBridge label for this iMac. It does not change the system hostname."));
+        auto *identityForm = new QFormLayout;
+        identityForm->addRow(QStringLiteral("This iMac"), localNameEditor_);
+        easyLayout->addLayout(identityForm);
+        connect(localNameEditor_, &QLineEdit::editingFinished, this, [this] {
+            saveLocalName();
+        });
         pairingStatus_ = new QLabel;
         pairingStatus_->setWordWrap(true);
         pairingStatus_->setStyleSheet(QStringLiteral(
@@ -1008,6 +1033,8 @@ public:
         hostButton->setToolTip(QStringLiteral(
             "Starts a five-minute listener. On the input-owner host, enter this client's LAN address and the displayed code."));
         connect(hostButton, &QPushButton::clicked, this, [this, hostButton] {
+            if (!saveLocalName())
+                return;
             if (hostPairingProcess_) {
                 pairingStatus_->setText(QStringLiteral(
                     "This client is already waiting for a host to enter the displayed code."));
@@ -1155,6 +1182,8 @@ public:
         pairingCodeFont.setBold(true);
         pairingCode_->setFont(pairingCodeFont);
         connect(joinButton, &QPushButton::clicked, this, [this] {
+            if (!saveLocalName())
+                return;
             const PairJoinDraft draft{localName_, pairingAddress_->text().trimmed(),
                 pairingCode_->text().trimmed(), selectedPlacement(), true};
             if (draft.localName.isEmpty() || draft.clientAddress.isEmpty() || draft.code.isEmpty()) {
@@ -1862,6 +1891,32 @@ private:
         return placementPreview_->placement();
     }
 
+    bool saveLocalName() {
+        if (!localNameEditor_)
+            return true;
+        const QString candidate = localNameEditor_->text().trimmed();
+        const bool valid = !candidate.isEmpty() && candidate.size() <= 80
+            && std::all_of(candidate.cbegin(), candidate.cend(), [](QChar character) {
+                return character.isLetterOrNumber() && character.unicode() <= 0x7f
+                    || character == u' ' || character == u'.'
+                    || character == u'_' || character == u'-';
+            });
+        if (!valid) {
+            pairingStatus_->setText(QStringLiteral(
+                "This iMac name must be 1–80 ASCII letters, digits, spaces, '.', '_' or '-'."));
+            localNameEditor_->setFocus();
+            return false;
+        }
+        if (candidate == localName_)
+            return true;
+        localName_ = candidate;
+        QSettings settings(QStringLiteral("CachyOS"), QStringLiteral("CachyBridge Setup"));
+        settings.setValue(QStringLiteral("identity/name"), localName_);
+        settings.sync();
+        sendTrayCommand("refresh-identity");
+        return true;
+    }
+
     static QString localLanAddress() {
         QProcess process;
         process.start(QStringLiteral("ip"), {
@@ -1885,6 +1940,7 @@ private:
     }
 
     std::unique_ptr<SetupStore> store_;
+    QLineEdit *localNameEditor_ = nullptr;
     QLineEdit *pairingCode_ = nullptr;
     QLineEdit *pairingAddress_ = nullptr;
     DisplayLayoutPreview *placementPreview_ = nullptr;

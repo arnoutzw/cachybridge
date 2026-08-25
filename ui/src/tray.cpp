@@ -83,6 +83,12 @@ QSettings setupSettings() {
     return QSettings(QStringLiteral("CachyOS"), QStringLiteral("CachyBridge Setup"));
 }
 
+QString configuredLocalName() {
+    QSettings settings = setupSettings();
+    const QString name = settings.value(QStringLiteral("identity/name")).toString().trimmed();
+    return name.isEmpty() ? QSysInfo::machineHostName() : name;
+}
+
 bool setLoginAutostart(bool enabled) {
     const QString path = managedAutostartPath();
     if (path.isEmpty())
@@ -174,6 +180,21 @@ public:
         }
     }
 
+    void refreshIdentity() {
+        if (!pairingRequests_)
+            return;
+        if (pairingAdvertiser_ && pairingAdvertiser_->state() != QProcess::NotRunning) {
+            pairingAdvertiser_->terminate();
+            if (!pairingAdvertiser_->waitForFinished(500))
+                pairingAdvertiser_->kill();
+        }
+        if (pairingAdvertiser_) {
+            pairingAdvertiser_->deleteLater();
+            pairingAdvertiser_ = nullptr;
+        }
+        startPairingAdvertisement();
+    }
+
 private:
     static QString pairedPeerIdFromOutput(const QByteArray &output) {
         for (const QByteArray &line : output.split('\n')) {
@@ -206,9 +227,16 @@ private:
             return;
         }
         connect(pairingRequests_, &QUdpSocket::readyRead, this, [this] { readPairingRequests(); });
+        startPairingAdvertisement();
+    }
+
+    void startPairingAdvertisement() {
+        const QString cli = bundledCliPath();
+        if (!pairingRequests_ || cli.isEmpty())
+            return;
         pairingAdvertiser_ = new QProcess(this);
         pairingAdvertiser_->start(cli, {QStringLiteral("pair-advertise"),
-            QStringLiteral("--local-name"), QSysInfo::machineHostName(),
+            QStringLiteral("--local-name"), configuredLocalName(),
             QStringLiteral("--pairing-port"), QString::number(pairingPort)});
     }
 
@@ -318,7 +346,7 @@ private:
         pairingProcess_->start(cli, {QStringLiteral("pair-client"),
             QStringLiteral("--listen"), QStringLiteral("0.0.0.0:45232"),
             QStringLiteral("--code"), code,
-            QStringLiteral("--local-name"), QSysInfo::machineHostName(),
+            QStringLiteral("--local-name"), configuredLocalName(),
             QStringLiteral("--persistent-permissions")});
         if (!pairingProcess_->waitForStarted()) {
             pairingDialog_->reject();
@@ -455,10 +483,12 @@ int main(int argc, char **argv) {
     if (!trayControl.listen(trayControlServerName()))
         return 1;
     CachyBridgeTray tray(application);
-    QObject::connect(&trayControl, &QLocalServer::newConnection, &application, [&trayControl] {
+    QObject::connect(&trayControl, &QLocalServer::newConnection, &application, [&trayControl, &tray] {
         while (QLocalSocket *socket = trayControl.nextPendingConnection()) {
-            const auto reply = [socket] {
-                socket->readAll();
+            const auto reply = [socket, &tray] {
+                const QByteArray command = socket->readAll().trimmed();
+                if (command == "refresh-identity")
+                    tray.refreshIdentity();
                 socket->write("ok");
                 socket->disconnectFromServer();
                 socket->deleteLater();
