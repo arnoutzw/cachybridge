@@ -1326,6 +1326,7 @@ public:
             "QListWidget { border: 1px solid palette(mid); border-radius: 6px; }"));
         clientHostLayout->addWidget(new QLabel(QStringLiteral("Host iMac")));
         clientHostLayout->addWidget(knownHosts);
+        easyLayout->addWidget(clientHostPanel);
         const auto refreshClientHost = [this, knownHosts] {
             QString error;
             const QStringList peers = store_->configuredPeers(&error);
