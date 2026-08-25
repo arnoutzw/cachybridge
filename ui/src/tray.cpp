@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 namespace {
 
@@ -196,7 +197,10 @@ private:
         QSettings settings = setupSettings();
         const QString configuredRole = settings.value(QStringLiteral("startup/role")).toString();
         const QString cli = bundledCliPath();
-        if (configuredRole != QStringLiteral("client") && !hasClientPeerRole(cli))
+        // A saved topology is authoritative: a host may retain an older UI
+        // role preference, but it must never occupy the client discovery port.
+        const std::optional<bool> peerRole = configuredClientRole(cli);
+        if (peerRole ? !*peerRole : configuredRole != QStringLiteral("client"))
             return;
         if (cli.isEmpty())
             return;
@@ -214,17 +218,19 @@ private:
             QStringLiteral("--pairing-port"), QString::number(pairingPort)});
     }
 
-    static bool hasClientPeerRole(const QString &cli) {
+    static std::optional<bool> configuredClientRole(const QString &cli) {
         if (cli.isEmpty())
-            return false;
+            return std::nullopt;
         QProcess process;
         process.start(cli, {QStringLiteral("peer-list")});
         if (!process.waitForStarted() || !process.waitForFinished(2000)
             || process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-            return false;
+            return std::nullopt;
         }
         const QStringList peers = QString::fromUtf8(process.readAllStandardOutput())
             .split(u'\n', Qt::SkipEmptyParts);
+        if (peers.isEmpty())
+            return std::nullopt;
         return std::any_of(peers.cbegin(), peers.cend(), [](const QString &peer) {
             return peer.section(u'\t', 2, 2) == QStringLiteral("right");
         });
