@@ -1922,8 +1922,7 @@ private:
         return screen ? screen->size() : QSize(2560, 1440);
     }
 
-    QString startUserService(const QString &unit, const QStringList &command,
-                             bool restartOnFailure = false) const {
+    QString startUserService(const QString &unit, const QStringList &command) const {
         const QString systemdRun = QStandardPaths::findExecutable(QStringLiteral("systemd-run"));
         const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
         if (systemdRun.isEmpty() || systemctl.isEmpty())
@@ -1935,8 +1934,7 @@ private:
 
         QStringList arguments{
             QStringLiteral("--user"), QStringLiteral("--unit=") + unit,
-            QStringLiteral("--collect"), QStringLiteral("--property=Restart=")
-                + (restartOnFailure ? QStringLiteral("on-failure") : QStringLiteral("no")),
+            QStringLiteral("--collect"), QStringLiteral("--property=Restart=no"),
         };
         for (const QString &name : {QStringLiteral("XDG_RUNTIME_DIR"),
                                     QStringLiteral("DBUS_SESSION_BUS_ADDRESS"),
@@ -1969,7 +1967,7 @@ private:
             QStringLiteral("seamless-client-config"), QStringLiteral("--peer"), peerId,
             QStringLiteral("--peer-width"), QString::number(size.width()),
             QStringLiteral("--peer-y"), QStringLiteral("0"),
-        }, true);
+        });
     }
 
     QString configuredPeerIdForUnpair(QString *error) {
