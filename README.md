@@ -134,7 +134,7 @@ sudo target/release/cachybridge kernel-self-test
   a second Noise-PSK connection while a seamless session is running. It
   requires the `wl-clipboard` package (`wl-copy` and `wl-paste`) on both
   desktops and limits a single text/image item to 8 MiB.
-- Copying one or more regular local files is supported up to 64 MiB in total.
+- Copying one or more regular local files is supported up to 512 MiB in total.
   Received files are placed in the private CachyBridge data cache and exposed
   to the desktop as a normal file clipboard selection. Directories, remote
   URLs, duplicate file names, and larger batches are intentionally rejected.

@@ -33,7 +33,7 @@ const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum aggregate size of one regular-file clipboard transfer. File data is
 /// transmitted in-memory, so this is intentionally bounded separately from
 /// image/text clipboard content.
-const MAX_FILE_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FILE_TRANSFER_BYTES: usize = 512 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(10);
 const FILE_TRANSFER_MIME: &str = "application/x-cachybridge-file-list";
@@ -97,6 +97,7 @@ pub enum ClipboardError {
 pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
     let mut last_value: Option<ClipboardContent> = None;
     let mut incoming: Option<IncomingTransfer> = None;
+    let mut oversized_selection_reported = false;
     // Keep ownership of the provider we started.  A foreground wl-copy
     // process can otherwise keep a stale Wayland selection alive after the
     // user copies a newer value, making a just-received image flip back to an
@@ -116,19 +117,33 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
             }
         }
         if Instant::now() >= next_poll {
-            if let Some(content) = read_content()? {
-                if last_value.as_ref() != Some(&content) {
-                    // A user-originated replacement must retire our previous
-                    // provider before it can reassert the stale selection.
-                    stop_provider(&mut provider);
-                    send_content(&mut connection, &content)?;
-                    eprintln!(
-                        "clipboard sent {} ({} bytes)",
-                        content.mime_type,
-                        content.bytes.len()
-                    );
-                    last_value = Some(content);
+            match read_content() {
+                Ok(Some(content)) => {
+                    oversized_selection_reported = false;
+                    if last_value.as_ref() != Some(&content) {
+                        // A user-originated replacement must retire our previous
+                        // provider before it can reassert the stale selection.
+                        stop_provider(&mut provider);
+                        send_content(&mut connection, &content)?;
+                        eprintln!(
+                            "clipboard sent {} ({} bytes)",
+                            content.mime_type,
+                            content.bytes.len()
+                        );
+                        last_value = Some(content);
+                    }
                 }
+                Ok(None) => oversized_selection_reported = false,
+                Err(ClipboardError::TooLarge) => {
+                    if !oversized_selection_reported {
+                        eprintln!(
+                            "clipboard selection exceeds the {} MiB transfer limit; leaving it local",
+                            MAX_FILE_TRANSFER_BYTES / (1024 * 1024)
+                        );
+                        oversized_selection_reported = true;
+                    }
+                }
+                Err(error) => return Err(error),
             }
             next_poll = Instant::now() + POLL_INTERVAL;
         }

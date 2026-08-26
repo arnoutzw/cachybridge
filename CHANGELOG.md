@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.0.1 — 2026-08-26
+
+- Raised regular-file clipboard transfers to 512 MiB, including video files.
+- Oversize clipboard selections now remain local without restarting clipboard sync.
+- Improved KVM reconnect behavior after a dropped host/client transport.
+
 ## 1.0.0 — 2026-08-25
 
 - First complete CachyBridge release for two CachyOS/KDE Wayland iMacs.

@@ -1,6 +1,6 @@
 [package]
 name = "cachybridge"
-version = "4.0.0"
+version = "4.0.1"
 edition = "2021"
 license = "MIT"
 description = "CachyOS LAN mouse and keyboard sharing with Wayland portal integration"
