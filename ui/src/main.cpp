@@ -1858,7 +1858,16 @@ public:
         diagnosticsTimer->start();
 
         auto *layout = new QVBoxLayout(this);
-        layout->addWidget(roleBanner);
+        auto *titleRow = new QHBoxLayout;
+        titleRow->addWidget(roleBanner, 1);
+        auto *minimizeToTrayButton = new QPushButton(QStringLiteral("Minimize to tray"));
+        minimizeToTrayButton->setToolTip(QStringLiteral(
+            "Hide this window. CachyBridge continues running from the system tray."));
+        connect(minimizeToTrayButton, &QPushButton::clicked, this, [this] {
+            hide();
+        });
+        titleRow->addWidget(minimizeToTrayButton);
+        layout->addLayout(titleRow);
         auto *tabs = new QTabWidget;
         tabs->addTab(easyPairing, QStringLiteral("Connect"));
         tabs->addTab(clipboardViewer, QStringLiteral("Clipboard"));
