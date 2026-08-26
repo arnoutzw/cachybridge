@@ -26,6 +26,8 @@ const CHUNK_KIND: u8 = 2;
 const FILE_START_KIND: u8 = 3;
 const FILE_CHUNK_KIND: u8 = 4;
 const FILE_FINISH_KIND: u8 = 5;
+const FILE_ACCEPT_KIND: u8 = 6;
+const FILE_REJECT_KIND: u8 = 7;
 const START_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 1 + 4;
 const CHUNK_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 4;
 // `poll_receive_payload` intentionally waits until a complete encrypted record
@@ -42,6 +44,7 @@ const MAX_FILE_TRANSFER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 256;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_INTERVAL: Duration = Duration::from_millis(10);
+const FILE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 const FILE_TRANSFER_MIME: &str = "application/x-cachybridge-file-list";
 const FILE_BUNDLE_PREFIX: &[u8] = b"CBFL1";
 
@@ -161,9 +164,13 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
             let Some(record) = connection.poll_receive_payload()? else {
                 break;
             };
-            if let Some(received) =
-                process_received_record(&record, &mut incoming, &mut incoming_files, &mut provider)?
-            {
+            if let Some(received) = process_received_record(
+                &mut connection,
+                &record,
+                &mut incoming,
+                &mut incoming_files,
+                &mut provider,
+            )? {
                 update_received_baseline(received, &mut last_value, &mut last_file_selection);
             }
         }
@@ -268,6 +275,7 @@ fn is_received_file_selection(selection: &FileSelection) -> bool {
 }
 
 fn process_received_record(
+    connection: &mut SecureConnection,
     record: &[u8],
     incoming: &mut Option<IncomingTransfer>,
     incoming_files: &mut Option<IncomingFileTransfer>,
@@ -277,7 +285,7 @@ fn process_received_record(
         record_kind(record),
         Some(FILE_START_KIND | FILE_CHUNK_KIND | FILE_FINISH_KIND)
     ) {
-        if let Some(selection) = receive_file_record(record, incoming_files)? {
+        if let Some(selection) = receive_file_record(connection, record, incoming_files)? {
             stop_provider(provider);
             write_uri_list(&selection, provider)?;
             eprintln!(
@@ -287,6 +295,12 @@ fn process_received_record(
             );
             return Ok(Some(ReceivedClipboard::Files(selection)));
         }
+    } else if matches!(
+        record_kind(record),
+        Some(FILE_ACCEPT_KIND | FILE_REJECT_KIND)
+    ) {
+        // Approval records are consumed by the sender while it waits for the
+        // receiving iMac's explicit choice. A late duplicate is harmless.
     } else if let Some(content) = receive_record(record, incoming)? {
         write_content(&content, provider)?;
         eprintln!(
@@ -332,16 +346,34 @@ fn send_file_transfer(
         return Err(ClipboardError::TooLarge);
     }
     let id = random_transfer_id();
+    let started = Instant::now();
+    update_transfer_status(
+        "sending",
+        "awaiting approval",
+        selection
+            .files
+            .first()
+            .map(|file| file.name.as_str())
+            .unwrap_or("files"),
+        0,
+        selection.total_bytes,
+        started,
+        None,
+    )?;
     connection.send_payload(&encode_file_start(id, selection)?)?;
-    drain_records_while_sending(
+    if !wait_for_file_approval(
         connection,
+        id,
         incoming,
         incoming_files,
         provider,
         last_value,
         last_file_selection,
-    )?;
-    let started = Instant::now();
+        selection,
+        started,
+    )? {
+        return Ok(());
+    }
     let mut last_status = started;
     let mut transferred = 0_u64;
     let mut buffer = [0_u8; MAX_CHUNK_BYTES];
@@ -426,12 +458,67 @@ fn drain_records_while_sending(
             break;
         };
         if let Some(received) =
-            process_received_record(&record, incoming, incoming_files, provider)?
+            process_received_record(connection, &record, incoming, incoming_files, provider)?
         {
             update_received_baseline(received, last_value, last_file_selection);
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_file_approval(
+    connection: &mut SecureConnection,
+    id: u64,
+    incoming: &mut Option<IncomingTransfer>,
+    incoming_files: &mut Option<IncomingFileTransfer>,
+    provider: &mut Option<std::process::Child>,
+    last_value: &mut Option<ClipboardContent>,
+    last_file_selection: &mut Option<FileSelection>,
+    selection: &FileSelection,
+    started: Instant,
+) -> Result<bool, ClipboardError> {
+    let name = selection
+        .files
+        .first()
+        .map(|file| file.name.as_str())
+        .unwrap_or("files");
+    loop {
+        if let Some(record) = connection.poll_receive_payload()? {
+            if let Some(approved) = decode_file_decision(&record, id)? {
+                update_transfer_status(
+                    "sending",
+                    if approved { "transferring" } else { "declined" },
+                    name,
+                    0,
+                    selection.total_bytes,
+                    started,
+                    None,
+                )?;
+                return Ok(approved);
+            }
+            if let Some(received) =
+                process_received_record(connection, &record, incoming, incoming_files, provider)?
+            {
+                update_received_baseline(received, last_value, last_file_selection);
+            }
+        } else if started.elapsed() >= FILE_APPROVAL_TIMEOUT {
+            update_transfer_status(
+                "sending",
+                "timed out",
+                name,
+                0,
+                selection.total_bytes,
+                started,
+                None,
+            )?;
+            return Err(ClipboardError::Command(
+                "the receiving iMac did not respond to the file-transfer offer".to_owned(),
+            ));
+        } else {
+            thread::sleep(IDLE_INTERVAL);
+        }
+    }
 }
 
 fn send_content(
@@ -573,7 +660,83 @@ fn encode_file_finish(id: u64) -> Vec<u8> {
     record
 }
 
+fn encode_file_decision(id: u64, approved: bool) -> Vec<u8> {
+    let mut record = Vec::with_capacity(RECORD_PREFIX.len() + 1 + 8);
+    record.extend_from_slice(RECORD_PREFIX);
+    record.push(if approved {
+        FILE_ACCEPT_KIND
+    } else {
+        FILE_REJECT_KIND
+    });
+    record.extend_from_slice(&id.to_be_bytes());
+    record
+}
+
+fn decode_file_decision(record: &[u8], expected_id: u64) -> Result<Option<bool>, ClipboardError> {
+    let Some(body) = record.strip_prefix(RECORD_PREFIX) else {
+        return Ok(None);
+    };
+    let Some((&kind, rest)) = body.split_first() else {
+        return Err(ClipboardError::InvalidRecord);
+    };
+    if !matches!(kind, FILE_ACCEPT_KIND | FILE_REJECT_KIND) {
+        return Ok(None);
+    }
+    if rest.len() != 8 {
+        return Err(ClipboardError::InvalidRecord);
+    }
+    let id = u64::from_be_bytes(rest.try_into().expect("fixed width"));
+    if id != expected_id {
+        return Err(ClipboardError::InvalidRecord);
+    }
+    Ok(Some(kind == FILE_ACCEPT_KIND))
+}
+
+fn request_file_transfer_approval(manifest: &FileManifest, total_bytes: u64) -> bool {
+    let file_summary = if manifest.len() == 1 {
+        manifest[0].0.clone()
+    } else {
+        format!("{} files (starting with {})", manifest.len(), manifest[0].0)
+    };
+    let message = format!(
+        "A paired CachyBridge iMac wants to send:\n\n{file_summary}\n{}\n\nAccept and save it in Downloads/CachyBridge?",
+        human_size(total_bytes)
+    );
+    match Command::new("kdialog")
+        .args([
+            "--title",
+            "CachyBridge file transfer",
+            "--yes-label",
+            "Accept",
+            "--no-label",
+            "Decline",
+            "--yesno",
+            &message,
+        ])
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(error) => {
+            eprintln!("could not show file-transfer approval dialog: {error}");
+            false
+        }
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn receive_file_record(
+    connection: &mut SecureConnection,
     record: &[u8],
     incoming: &mut Option<IncomingFileTransfer>,
 ) -> Result<Option<FileSelection>, ClipboardError> {
@@ -589,6 +752,34 @@ fn receive_file_record(
                 return Err(ClipboardError::InvalidRecord);
             }
             let (id, manifest, total_bytes) = decode_file_start(rest)?;
+            let offer_started = Instant::now();
+            let name = manifest
+                .first()
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("files");
+            update_transfer_status(
+                "receiving",
+                "awaiting approval",
+                name,
+                0,
+                total_bytes,
+                offer_started,
+                Some(&received_airdrop_root()?),
+            )?;
+            let approved = request_file_transfer_approval(&manifest, total_bytes);
+            if !approved {
+                connection.send_payload(&encode_file_decision(id, false))?;
+                update_transfer_status(
+                    "receiving",
+                    "declined",
+                    name,
+                    0,
+                    total_bytes,
+                    offer_started,
+                    Some(&received_airdrop_root()?),
+                )?;
+                return Ok(None);
+            }
             let root = received_airdrop_root()?;
             let staging_directory = create_staging_directory(&root)?;
             let mut files = Vec::with_capacity(manifest.len());
@@ -603,6 +794,7 @@ fn receive_file_record(
                 });
             }
             let started = Instant::now();
+            connection.send_payload(&encode_file_decision(id, true))?;
             update_transfer_status(
                 "receiving",
                 "transferring",
@@ -1560,6 +1752,18 @@ mod tests {
             decode_file_chunk(&chunk[RECORD_PREFIX.len() + 1..]).unwrap(),
             (42, 0, 16_384, &[7; 64][..])
         );
+    }
+
+    #[test]
+    fn file_transfer_approval_is_bound_to_its_offer() {
+        let accepted = encode_file_decision(42, true);
+        let rejected = encode_file_decision(42, false);
+        assert_eq!(decode_file_decision(&accepted, 42).unwrap(), Some(true));
+        assert_eq!(decode_file_decision(&rejected, 42).unwrap(), Some(false));
+        assert!(matches!(
+            decode_file_decision(&accepted, 7),
+            Err(ClipboardError::InvalidRecord)
+        ));
     }
 
     #[test]

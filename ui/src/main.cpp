@@ -1747,10 +1747,20 @@ public:
             const QString amount = completedValid && totalValid
                 ? QStringLiteral("%1 / %2").arg(QLocale().formattedDataSize(completed), QLocale().formattedDataSize(total))
                 : QString();
-            transferStatus->setText(state == QStringLiteral("completed")
-                ? QStringLiteral("%1 complete — %2").arg(direction, name)
-                : QStringLiteral("%1 %2 — %3 at %4 MiB/s").arg(direction, name, amount)
+            if (state == QStringLiteral("awaiting approval")) {
+                transferStatus->setText(direction == QStringLiteral("sending")
+                    ? QStringLiteral("Waiting for the receiving iMac to accept — %1").arg(name)
+                    : QStringLiteral("Incoming file offer — choose Accept or Decline."));
+            } else if (state == QStringLiteral("declined")) {
+                transferStatus->setText(QStringLiteral("File transfer declined — %1").arg(name));
+            } else if (state == QStringLiteral("timed out")) {
+                transferStatus->setText(QStringLiteral("File transfer timed out — %1").arg(name));
+            } else if (state == QStringLiteral("completed")) {
+                transferStatus->setText(QStringLiteral("%1 complete — %2").arg(direction, name));
+            } else {
+                transferStatus->setText(QStringLiteral("%1 %2 — %3 at %4 MiB/s").arg(direction, name, amount)
                     .arg(speedMiB, 0, 'f', 1));
+            }
         };
         auto *transferTimer = new QTimer(this);
         transferTimer->setInterval(250);

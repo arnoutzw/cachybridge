@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.1.1 — 2026-08-26
+
+- File clipboard copies are now offers: the receiving iMac must explicitly
+  accept or decline a KDE popup before CachyBridge sends file bytes.
+
 ## 4.1.0 — 2026-08-26
 
 - Reworked file clipboard transfer into an encrypted, disk-streaming flow.
