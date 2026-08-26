@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.1.0 — 2026-08-26
+
+- Reworked file clipboard transfer into an encrypted, disk-streaming flow.
+- Received files are staged safely, then published in `Downloads/CachyBridge`
+  and exposed as a native KDE file clipboard selection.
+- Added file-transfer progress, throughput, direction, and final destination to
+  the Clipboard tab.
+- Raised the aggregate file-transfer safeguard to 64 GiB without using file
+  size as RAM.
+
 ## 4.0.1 — 2026-08-26
 
 - Raised regular-file clipboard transfers to 512 MiB, including video files.

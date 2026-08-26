@@ -134,7 +134,9 @@ sudo target/release/cachybridge kernel-self-test
   a second Noise-PSK connection while a seamless session is running. It
   requires the `wl-clipboard` package (`wl-copy` and `wl-paste`) on both
   desktops and limits a single text/image item to 8 MiB.
-- Copying one or more regular local files is supported up to 512 MiB in total.
-  Received files are placed in the private CachyBridge data cache and exposed
-  to the desktop as a normal file clipboard selection. Directories, remote
-  URLs, duplicate file names, and larger batches are intentionally rejected.
+- Copying one or more regular local files starts an encrypted, streaming
+  transfer. Files are never loaded wholesale into RAM: the receiving iMac
+  stages them privately, publishes them in `Downloads/CachyBridge`, and puts
+  them on the desktop as a normal file clipboard selection. A 64 GiB aggregate
+  safeguard protects the receiver's disk. Directories, remote URLs, and
+  duplicate file names are intentionally not transferred.

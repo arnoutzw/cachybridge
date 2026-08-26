@@ -21,12 +21,15 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLocale>
+#include <QMap>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QMessageBox>
 #include <QImage>
 #include <QPixmap>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPainter>
 #include <QPaintEvent>
 #include <QProcess>
@@ -1707,8 +1710,52 @@ public:
         clipboardFont.setBold(true);
         clipboardHeading->setFont(clipboardFont);
         auto *clipboardHint = new QLabel(QStringLiteral(
-            "This is the item CachyBridge can send to the paired iMac. Text and file lists are shown below; images are previewed."));
+            "Copy files normally: CachyBridge transfers them securely and saves received files in Downloads/CachyBridge."));
         clipboardHint->setWordWrap(true);
+        auto *transferStatus = new QLabel(QStringLiteral("No file transfer in progress."));
+        auto *transferProgress = new QProgressBar;
+        transferProgress->setRange(0, 1000);
+        transferProgress->setValue(0);
+        transferProgress->setTextVisible(true);
+        transferProgress->setFormat(QStringLiteral("%p%"));
+        const QString transferStatusFile = QDir(qEnvironmentVariable("XDG_RUNTIME_DIR"))
+            .filePath(QStringLiteral("cachybridge/file-transfer-status"));
+        const auto refreshTransferStatus = [transferStatus, transferProgress, transferStatusFile] {
+            QFile file(transferStatusFile);
+            if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                transferStatus->setText(QStringLiteral("No file transfer in progress."));
+                transferProgress->setValue(0);
+                return;
+            }
+            QMap<QString, QString> values;
+            for (const QString &line : QString::fromUtf8(file.readAll()).split(u'\n', Qt::SkipEmptyParts)) {
+                const qsizetype separator = line.indexOf(u'=');
+                if (separator > 0)
+                    values.insert(line.left(separator), line.mid(separator + 1));
+            }
+            bool completedValid = false;
+            bool totalValid = false;
+            const qulonglong completed = values.value(QStringLiteral("completed")).toULongLong(&completedValid);
+            const qulonglong total = values.value(QStringLiteral("total")).toULongLong(&totalValid);
+            const int progress = totalValid && total > 0
+                ? qBound(0, int((completed * 1000) / total), 1000) : 0;
+            transferProgress->setValue(progress);
+            const QString direction = values.value(QStringLiteral("direction"));
+            const QString state = values.value(QStringLiteral("state"));
+            const QString name = values.value(QStringLiteral("name"));
+            const double speedMiB = values.value(QStringLiteral("speed_bps")).toDouble() / (1024.0 * 1024.0);
+            const QString amount = completedValid && totalValid
+                ? QStringLiteral("%1 / %2").arg(QLocale().formattedDataSize(completed), QLocale().formattedDataSize(total))
+                : QString();
+            transferStatus->setText(state == QStringLiteral("completed")
+                ? QStringLiteral("%1 complete — %2").arg(direction, name)
+                : QStringLiteral("%1 %2 — %3 at %4 MiB/s").arg(direction, name, amount)
+                    .arg(speedMiB, 0, 'f', 1));
+        };
+        auto *transferTimer = new QTimer(this);
+        transferTimer->setInterval(250);
+        connect(transferTimer, &QTimer::timeout, this, refreshTransferStatus);
+        transferTimer->start();
         auto *clipboardSummary = new QLabel;
         clipboardSummary->setWordWrap(true);
         clipboardSummary->setStyleSheet(QStringLiteral(
@@ -1801,6 +1848,8 @@ public:
         connect(refreshClipboard, &QPushButton::clicked, this, showClipboard);
         clipboardLayout->addWidget(clipboardHeading);
         clipboardLayout->addWidget(clipboardHint);
+        clipboardLayout->addWidget(transferStatus);
+        clipboardLayout->addWidget(transferProgress);
         clipboardLayout->addWidget(clipboardSummary);
         clipboardLayout->addWidget(clipboardPreview, 1);
         clipboardLayout->addWidget(clipboardImage, 1);
