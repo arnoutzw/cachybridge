@@ -430,11 +430,16 @@ private:
             QStringLiteral("--user"),
             QStringLiteral("--unit=") + unit,
             QStringLiteral("--collect"),
-            // A failed connection or a dismissed portal request must not
-            // repeatedly reopen the InputCapture consent dialog. The tray
-            // tries once at login; Connect in Setup is the intentional retry.
-            QStringLiteral("--property=Restart=no"),
+            // A host reconnects after transport loss. It now verifies the
+            // client connection before requesting InputCapture, and a
+            // declined portal request exits successfully, so this cannot
+            // reopen the permission dialog in a failure loop. The client
+            // keeps its portal sessions alive and accepts replacement hosts.
+            QStringLiteral("--property=Restart=")
+                + (host ? QStringLiteral("on-failure") : QStringLiteral("no")),
         };
+        if (host)
+            arguments << QStringLiteral("--property=RestartSec=2s");
         for (const QString &name : {QStringLiteral("XDG_RUNTIME_DIR"),
                                     QStringLiteral("DBUS_SESSION_BUS_ADDRESS"),
                                     QStringLiteral("XDG_SESSION_TYPE"),

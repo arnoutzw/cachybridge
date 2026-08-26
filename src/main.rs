@@ -513,6 +513,12 @@ fn run_setup_gui(
 fn main() {
     if let Err(error) = run(Cli::parse()) {
         eprintln!("cachybridge: {error}");
+        // A declined portal request is an intentional user decision. Report
+        // it, but do not make a service manager interpret it as a crash and
+        // reopen the same consent dialog in a restart loop.
+        if error.to_string().contains("was cancelled by the user") {
+            return;
+        }
         std::process::exit(1);
     }
 }
@@ -1395,7 +1401,7 @@ fn run_seamless_client(
 fn run_seamless_client_with_sessions(
     listen: SocketAddr,
     psk: [u8; 32],
-    injector: seamless::RemoteDesktopInjector,
+    mut injector: seamless::RemoteDesktopInjector,
     mut return_watcher: seamless::EdgeReturnWatcher,
     topology_changed: Option<Receiver<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1405,104 +1411,115 @@ fn run_seamless_client_with_sessions(
         "seamless client ready; waiting for host on {}",
         listener.local_addr()?
     );
-    let (stream, peer) = loop {
-        if let Some(receiver) = &topology_changed {
-            match receiver.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "topology updated; restart client portal session",
-                    )
-                    .into())
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        match listener.accept() {
-            Ok(connection) => break connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    eprintln!("host TCP connection from {peer}; authenticating");
-    let connection = SecureConnection::connect(stream, Role::Client, &psk)?;
-    connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
-    let mut client = seamless::SeamlessClient::new(injector, connection);
-    let mut last_peer_message = Instant::now();
-
-    let result: Result<(), Box<dyn std::error::Error>> = loop {
-        if let Some(receiver) = &topology_changed {
-            match receiver.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => {
-                    break Err(Box::new(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "topology updated; restart client portal session",
-                    )))
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        // Always drain portal signals. Otherwise a right-edge activation from
-        // before Enter could be mistaken for a return immediately afterward.
-        let return_position = return_watcher.poll_exit()?;
-        if client.remote_active() {
-            if let Some((edge, y)) = return_position {
-                let x = match edge {
-                    protocol::WireEdge::Right => -1,
-                    protocol::WireEdge::Left => {
-                        client
-                            .entry()
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "left-edge return has no authenticated entry coordinate",
-                                )
-                            })?
-                            .x
+    loop {
+        let (stream, peer) = loop {
+            if let Some(receiver) = &topology_changed {
+                match receiver.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "topology updated; restart client portal session",
+                        )
+                        .into())
                     }
-                };
-                client.request_exit(edge, handoff::Point { x, y })?;
-                eprintln!("client edge return sent; waiting for the next host entry");
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        eprintln!("host TCP connection from {peer}; authenticating");
+        let connection = match SecureConnection::connect(stream, Role::Client, &psk) {
+            Ok(connection) => connection,
+            Err(error) => {
+                eprintln!("rejected host connection: {error}");
                 continue;
             }
-        }
-        match client.poll_next()? {
-            Some(message) => {
-                last_peer_message = Instant::now();
-                // HandoffRelease is the normal acknowledgement of a client
-                // right-edge return. It must leave the portal sessions and
-                // encrypted connection alive so the next crossing works.
-                let terminal = matches!(message, Message::Goodbye);
-                client.handle(message)?;
-                if terminal {
-                    break Ok(());
-                }
-            }
-            None => {
-                if client.remote_active()
-                    && last_peer_message.elapsed() > Duration::from_millis(PEER_TIMEOUT_MS)
-                {
-                    break Err(Box::new(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "seamless host heartbeat timed out",
-                    )));
-                }
-                std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
-            }
-        }
-    };
+        };
+        connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
+        let mut client = seamless::SeamlessClient::new(injector, connection);
+        let mut last_peer_message = Instant::now();
 
-    // Safety invariant: every receive, protocol, and injection failure closes
-    // the RemoteDesktop sender, which releases its pressed input ledger.
-    let release_result = client.close();
-    let watcher_result = return_watcher.close();
-    result?;
-    release_result?;
-    watcher_result?;
-    eprintln!("seamless client session complete; all remote input released");
-    Ok(())
+        let result: Result<(), Box<dyn std::error::Error>> =
+            (|| -> Result<(), Box<dyn std::error::Error>> {
+                loop {
+                    if let Some(receiver) = &topology_changed {
+                        match receiver.try_recv() {
+                            Ok(()) | Err(TryRecvError::Disconnected) => {
+                                break Err(Box::new(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "topology updated; restart client portal session",
+                                )))
+                            }
+                            Err(TryRecvError::Empty) => {}
+                        }
+                    }
+                    // Always drain portal signals. Otherwise a right-edge activation
+                    // from before Enter could be mistaken for a return immediately afterward.
+                    let return_position = return_watcher.poll_exit()?;
+                    if client.remote_active() {
+                        if let Some((edge, y)) = return_position {
+                            let x = match edge {
+                                protocol::WireEdge::Right => -1,
+                                protocol::WireEdge::Left => {
+                                    let entry = client.entry().ok_or_else(|| {
+                                        io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "left-edge return has no authenticated entry coordinate",
+                                        )
+                                    })?;
+                                    entry.x
+                                }
+                            };
+                            client.request_exit(edge, handoff::Point { x, y })?;
+                            eprintln!("client edge return sent; waiting for host reconnect");
+                            continue;
+                        }
+                    }
+                    match client.poll_next()? {
+                        Some(message) => {
+                            last_peer_message = Instant::now();
+                            let terminal = matches!(message, Message::Goodbye);
+                            client.handle(message)?;
+                            if terminal {
+                                break Ok(());
+                            }
+                        }
+                        None => {
+                            if client.remote_active()
+                                && last_peer_message.elapsed()
+                                    > Duration::from_millis(PEER_TIMEOUT_MS)
+                            {
+                                break Err(Box::new(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "seamless host heartbeat timed out",
+                                )));
+                            }
+                            std::thread::sleep(CLIENT_IDLE_POLL_INTERVAL);
+                        }
+                    }
+                }
+            })();
+
+        // Safety invariant: every receive, protocol, and injection failure
+        // releases virtual pressed state before a replacement host connects.
+        let release_result = client.close();
+        let (next_injector, _) = client.into_parts();
+        injector = next_injector;
+        release_result?;
+        match result {
+            Ok(()) => eprintln!("host session closed; client remains ready for reconnect"),
+            Err(error) if error.to_string().contains("topology updated") => return Err(error),
+            Err(error) => {
+                eprintln!("host session lost: {error}; client remains ready for reconnect")
+            }
+        }
+    }
 }
 
 fn configured_peer(

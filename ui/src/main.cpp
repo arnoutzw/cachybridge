@@ -1922,7 +1922,8 @@ private:
         return screen ? screen->size() : QSize(2560, 1440);
     }
 
-    QString startUserService(const QString &unit, const QStringList &command) const {
+    QString startUserService(const QString &unit, const QStringList &command,
+                             bool reconnectOnFailure = false) const {
         const QString systemdRun = QStandardPaths::findExecutable(QStringLiteral("systemd-run"));
         const QString systemctl = QStandardPaths::findExecutable(QStringLiteral("systemctl"));
         if (systemdRun.isEmpty() || systemctl.isEmpty())
@@ -1934,8 +1935,11 @@ private:
 
         QStringList arguments{
             QStringLiteral("--user"), QStringLiteral("--unit=") + unit,
-            QStringLiteral("--collect"), QStringLiteral("--property=Restart=no"),
+            QStringLiteral("--collect"), QStringLiteral("--property=Restart=")
+                + (reconnectOnFailure ? QStringLiteral("on-failure") : QStringLiteral("no")),
         };
+        if (reconnectOnFailure)
+            arguments << QStringLiteral("--property=RestartSec=2s");
         for (const QString &name : {QStringLiteral("XDG_RUNTIME_DIR"),
                                     QStringLiteral("DBUS_SESSION_BUS_ADDRESS"),
                                     QStringLiteral("XDG_SESSION_TYPE"),
@@ -2031,7 +2035,7 @@ private:
             QStringLiteral("--peer-width"), QString::number(remote.width()),
             QStringLiteral("--peer-height"), QString::number(remote.height()),
             QStringLiteral("--peer-y"), QStringLiteral("0"),
-        });
+        }, true);
     }
 
     void rememberStartupSession(const QString &peerId, MachineRole role,
