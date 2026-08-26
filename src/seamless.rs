@@ -40,6 +40,10 @@ pub struct InputCaptureAdapter {
     session: crate::portal_spike::InputCaptureSession,
     local_edge_x: i32,
     active_activation: Option<u32>,
+    /// A successful portal `Release` emits `Deactivated` asynchronously. It
+    /// is the normal end of a handoff, not a lost capture session; consume
+    /// exactly that signal before waiting for the next edge activation.
+    pending_release_deactivation: Option<u32>,
     absolute_motion: AbsoluteMotionTracker,
     /// One coalesced relative move per receiver dispatch. Buttons, keys and
     /// scrolling stay ordered and uncoalesced; pointer motion is safe to
@@ -654,6 +658,10 @@ fn set_nonblocking(device: &Device) -> io::Result<()> {
     Ok(())
 }
 
+fn is_expected_release_deactivation(expected: Option<u32>, observed: Option<u32>) -> bool {
+    expected.is_some_and(|activation_id| observed.is_none_or(|actual| actual == activation_id))
+}
+
 impl InputCaptureAdapter {
     pub fn start(
         edge: crate::portal_spike::CaptureEdge,
@@ -666,6 +674,7 @@ impl InputCaptureAdapter {
             )?,
             local_edge_x,
             active_activation: None,
+            pending_release_deactivation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
@@ -689,6 +698,7 @@ impl InputCaptureAdapter {
             )?,
             local_edge_x,
             active_activation: None,
+            pending_release_deactivation: None,
             absolute_motion: AbsoluteMotionTracker::default(),
             pending_motion: (0, 0),
             smooth_scroll_axes: (false, false),
@@ -900,6 +910,14 @@ impl CaptureBackend for InputCaptureAdapter {
                         "left-edge activation omitted a finite cursor position",
                     ));
                 }
+                Some(crate::portal_spike::CaptureSignal::Deactivated { activation_id })
+                    if is_expected_release_deactivation(
+                        self.pending_release_deactivation,
+                        activation_id,
+                    ) =>
+                {
+                    self.pending_release_deactivation = None;
+                }
                 Some(crate::portal_spike::CaptureSignal::Disabled)
                 | Some(crate::portal_spike::CaptureSignal::Deactivated { .. }) => {
                     return Err(io::Error::new(
@@ -974,12 +992,15 @@ impl CaptureBackend for InputCaptureAdapter {
                 activation_id,
                 Some((f64::from(restore.x), f64::from(restore.y))),
             )
-            .map_err(Self::map_portal_error)
+            .map_err(Self::map_portal_error)?;
+        self.pending_release_deactivation = Some(activation_id);
+        Ok(())
     }
 
     fn release_local_input(&mut self, restore: Option<Point>) -> io::Result<()> {
         self.absolute_motion.reset();
         self.pending_motion = (0, 0);
+        self.pending_release_deactivation = None;
         if let Some(trackpad) = &mut self.raw_trackpad_pinch {
             trackpad.reset()?;
         }
@@ -1345,8 +1366,12 @@ impl<C: CaptureBackend, T: MessageTransport> SeamlessHost<C, T> {
                 _ => return Err(SeamlessError::UnexpectedControl(Message::EnterAck)),
             },
             Message::EnterRejected => {
-                let _ = self.controller.peer_entry_rejected();
-                self.capture.release_local_input(None)?;
+                let Some(HandoffAction::WarpLocalPointer { at }) =
+                    self.controller.peer_entry_rejected().action
+                else {
+                    return Err(SeamlessError::UnexpectedControl(Message::EnterRejected));
+                };
+                self.capture.return_to_local(at)?;
             }
             message => {
                 let _ = self.close();
@@ -1773,6 +1798,16 @@ mod tests {
     }
 
     #[test]
+    fn normal_portal_deactivation_after_release_is_distinguished_from_loss() {
+        assert!(is_expected_release_deactivation(Some(7), Some(7)));
+        // Some portal backends omit activation_id on Deactivated. There can
+        // be only one active capture, so it still safely acknowledges it.
+        assert!(is_expected_release_deactivation(Some(7), None));
+        assert!(!is_expected_release_deactivation(Some(7), Some(8)));
+        assert!(!is_expected_release_deactivation(None, Some(7)));
+    }
+
+    #[test]
     fn absolute_motion_resets_and_bounds_layout_jumps() {
         let mut tracker = AbsoluteMotionTracker::default();
         tracker.update(0.0, 0.0).unwrap();
@@ -1913,7 +1948,7 @@ mod tests {
         host.forward_next(Duration::ZERO).unwrap();
         assert_eq!(host.state(), HandoffState::Local);
         let (capture, transport) = host.into_parts();
-        assert_eq!(capture.restores, vec![Some(Point { x: 0, y: 500 })]);
+        assert_eq!(capture.restores, vec![Some(Point { x: 1, y: 500 })]);
         assert_eq!(transport.sent.last(), Some(&Message::HandoffRelease));
     }
 

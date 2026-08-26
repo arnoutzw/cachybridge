@@ -222,7 +222,9 @@ impl HandoffController {
         self.state = HandoffState::Local;
         Transition::changed(
             self.state,
-            HandoffAction::WarpLocalPointer { at: local_entry },
+            HandoffAction::WarpLocalPointer {
+                at: self.local_interior(local_entry),
+            },
         )
     }
 
@@ -250,7 +252,10 @@ impl HandoffController {
         Transition::changed(
             self.state,
             HandoffAction::ReturnToLocal {
-                at: self.local_boundary(exit_edge, local_y),
+                at: self.local_interior(Point {
+                    x: self.local.edge_x(exit_edge),
+                    y: local_y,
+                }),
             },
         )
     }
@@ -267,10 +272,24 @@ impl HandoffController {
         Transition::changed(self.state, HandoffAction::ReleaseRemoteInput)
     }
 
-    fn local_boundary(&self, edge: Edge, y: i32) -> Point {
+    /// A portal release at the exact barrier coordinate can immediately
+    /// activate the same barrier again. Restore one logical pixel inside the
+    /// local display instead, leaving the physical pointer in normal local
+    /// compositor ownership. A one-pixel-wide display has no interior, so it
+    /// necessarily falls back to its only coordinate.
+    fn local_interior(&self, boundary: Point) -> Point {
         Point {
-            x: self.local.edge_x(edge),
-            y,
+            x: match self.peer_edge {
+                Edge::Left if self.local.width > 1 => self.local.x + 1,
+                Edge::Right if self.local.width > 1 => {
+                    self.local
+                        .right()
+                        .expect("validated rectangles have a right edge")
+                        - 1
+                }
+                _ => boundary.x,
+            },
+            y: boundary.y,
         }
     }
 }
@@ -410,7 +429,7 @@ mod tests {
             Transition::changed(
                 HandoffState::Local,
                 HandoffAction::WarpLocalPointer {
-                    at: Point { x: 0, y: 400 }
+                    at: Point { x: 1, y: 400 }
                 },
             )
         );
@@ -432,7 +451,7 @@ mod tests {
             Transition::changed(
                 HandoffState::Local,
                 HandoffAction::ReturnToLocal {
-                    at: Point { x: 0, y: 480 },
+                    at: Point { x: 1, y: 480 },
                 },
             )
         );
