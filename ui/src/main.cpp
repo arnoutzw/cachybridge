@@ -995,22 +995,14 @@ protected:
         painter.drawRect(bounds);
         painter.setPen(foreground);
         painter.drawText(QRectF(8, 4, width() - 16, 20), Qt::AlignLeft | Qt::AlignVCenter,
-            QStringLiteral("Frame time — latest active input frames"));
-        painter.drawText(QRectF(bounds.left(), bounds.bottom() + 8, bounds.width(), 20),
-            Qt::AlignCenter, QStringLiteral("Time →"));
+            QStringLiteral("Frame time (ms)"));
         if (samples_.isEmpty()) {
             painter.drawText(bounds, Qt::AlignCenter,
                 QStringLiteral("Waiting for active remote input…"));
             return;
         }
 
-        QVector<double> ordered = samples_;
-        std::sort(ordered.begin(), ordered.end());
-        const double p95 = ordered.at(static_cast<int>((ordered.size() - 1) * 0.95));
-        const double maximum = ordered.last();
-        // Keep normal 120/60 Hz detail visible. Rare spikes are marked at the
-        // chart ceiling instead of flattening the entire live trace.
-        const double yMaximum = std::max(20.0, std::min(50.0, std::ceil(p95 / 5.0) * 5.0));
+        constexpr double yMaximum = 60.0;
         const auto yFor = [&bounds, yMaximum](double milliseconds) {
             return bounds.bottom() - std::min(milliseconds, yMaximum) / yMaximum * bounds.height();
         };
@@ -1028,7 +1020,7 @@ protected:
         }
         painter.setPen(QPen(border, 1));
         painter.drawText(QRectF(2, bounds.top() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
-            QString::number(yMaximum, 'f', 0));
+            QStringLiteral("60"));
         painter.drawText(QRectF(2, bounds.bottom() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
             QStringLiteral("0"));
 
@@ -1044,11 +1036,6 @@ protected:
             if (samples_.at(index) > 16.67)
                 painter.drawPoint(QPointF(xFor(index), yFor(samples_.at(index))));
         }
-        painter.setPen(foreground);
-        painter.drawText(QRectF(bounds.left(), bounds.top() - 1, bounds.width(), 20),
-            Qt::AlignRight | Qt::AlignVCenter,
-            QStringLiteral("latest %1 ms · p95 %2 ms · max %3 ms")
-                .arg(samples_.last(), 0, 'f', 2).arg(p95, 0, 'f', 2).arg(maximum, 0, 'f', 2));
     }
 
 private:
@@ -1800,24 +1787,17 @@ public:
         auto *diagnosticsViewer = new QWidget;
         auto *diagnosticsLayout = new QVBoxLayout(diagnosticsViewer);
         diagnosticsLayout->setContentsMargins(12, 12, 12, 12);
-        auto *diagnosticsHeading = new QLabel(QStringLiteral("Live input performance"));
+        auto *diagnosticsHeading = new QLabel(QStringLiteral("Frame time"));
         QFont diagnosticsFont = diagnosticsHeading->font();
         diagnosticsFont.setBold(true);
         diagnosticsHeading->setFont(diagnosticsFont);
-        auto *diagnosticsHint = new QLabel(QStringLiteral(
-            "Time runs left to right; frame time is in milliseconds. The dashed guides mark 120 Hz (8.33 ms) and 60 Hz (16.67 ms). "
-            "Red points are slower than 60 Hz. Idle pauses are excluded."));
-        diagnosticsHint->setWordWrap(true);
         auto *frameTimePlot = new FrameTimePlot;
         auto *diagnosticsStatus = new QLabel(QStringLiteral(
             "Waiting for active remote input to collect frame-time samples."));
         diagnosticsStatus->setWordWrap(true);
-        auto *refreshDiagnostics = new QPushButton(QStringLiteral("Refresh diagnostics"));
         diagnosticsLayout->addWidget(diagnosticsHeading);
-        diagnosticsLayout->addWidget(diagnosticsHint);
         diagnosticsLayout->addWidget(frameTimePlot, 1);
         diagnosticsLayout->addWidget(diagnosticsStatus);
-        diagnosticsLayout->addWidget(refreshDiagnostics, 0, Qt::AlignLeft);
 
         const QString diagnosticsFile = QDir(qEnvironmentVariable("XDG_RUNTIME_DIR"))
             .filePath(role_ == MachineRole::Host
@@ -1827,6 +1807,7 @@ public:
             QFile file(diagnosticsFile);
             if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
                 frameTimePlot->setSamples({});
+                diagnosticsStatus->setVisible(true);
                 diagnosticsStatus->setText(QStringLiteral(
                     "Waiting for active remote input to collect frame-time samples."));
                 return;
@@ -1840,16 +1821,14 @@ public:
             }
             if (samples.isEmpty()) {
                 frameTimePlot->setSamples({});
+                diagnosticsStatus->setVisible(true);
                 diagnosticsStatus->setText(QStringLiteral(
                     "Waiting for active remote input to collect frame-time samples."));
                 return;
             }
-            const int sampleCount = samples.size();
             frameTimePlot->setSamples(std::move(samples));
-            diagnosticsStatus->setText(QStringLiteral(
-                "Live at 60 Hz · rolling window of %1 active input frames").arg(sampleCount));
+            diagnosticsStatus->setVisible(false);
         };
-        connect(refreshDiagnostics, &QPushButton::clicked, this, refreshPerformanceDiagnostics);
         auto *diagnosticsTimer = new QTimer(this);
         diagnosticsTimer->setInterval(16);
         connect(diagnosticsTimer, &QTimer::timeout, this, refreshPerformanceDiagnostics);
