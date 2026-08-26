@@ -150,6 +150,40 @@ QString bundledTrayPath() {
     return QStandardPaths::findExecutable(QStringLiteral("cachybridge-tray"));
 }
 
+QString dolphinServiceMenuPath() {
+    const QString data = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation);
+    return data.isEmpty() ? QString() : data + QStringLiteral("/kio/servicemenus/cachybridge-send.desktop");
+}
+
+bool installDolphinServiceMenu() {
+    const QString path = dolphinServiceMenuPath();
+    const QString cli = bundledCliPath();
+    if (path.isEmpty() || cli.isEmpty() || !QDir().mkpath(QFileInfo(path).dir().absolutePath()))
+        return false;
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return false;
+    const QByteArray desktop = QStringLiteral(
+        "[Desktop Entry]\n"
+        "Type=Service\n"
+        "Name=CachyBridge\n"
+        "MimeType=application/octet-stream;\n"
+        "X-KDE-Protocols=file\n"
+        "X-KDE-MinNumberOfUrls=1\n"
+        "X-KDE-MaxNumberOfUrls=256\n"
+        "X-KDE-Submenu=CachyBridge\n"
+        "Actions=sendToPairedIMac;\n\n"
+        "[Desktop Action sendToPairedIMac]\n"
+        "Name=Send to paired iMac\n"
+        "Icon=network-connect\n"
+        "Exec=%1 send-files -- %F\n")
+        .arg(cli).toUtf8();
+    if (file.write(desktop) != desktop.size())
+        return false;
+    file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    return file.commit();
+}
+
 QString managedAutostartPath() {
     const QString config = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
     return config.isEmpty() ? QString() : config + QStringLiteral("/autostart/cachybridge-tray.desktop");
@@ -1074,6 +1108,8 @@ public:
         : store_(std::move(store)), role_(role) {
         setWindowTitle(QStringLiteral("CachyBridge"));
         setMinimumWidth(580);
+        if (!installDolphinServiceMenu())
+            logSetupDiagnostic(QStringLiteral("Dolphin service menu installation failed"), QString());
 
         auto *roleBanner = new QLabel(role_ == MachineRole::Host
             ? QStringLiteral("Host · controls mouse and keyboard")
@@ -1710,7 +1746,7 @@ public:
         clipboardFont.setBold(true);
         clipboardHeading->setFont(clipboardFont);
         auto *clipboardHint = new QLabel(QStringLiteral(
-            "Copy files normally: CachyBridge transfers them securely and saves received files in Downloads/CachyBridge."));
+            "Use Dolphin: Actions → CachyBridge → Send to paired iMac. Accepted files are saved in Downloads/CachyBridge."));
         clipboardHint->setWordWrap(true);
         auto *transferStatus = new QLabel(QStringLiteral("No file transfer in progress."));
         auto *transferProgress = new QProgressBar;

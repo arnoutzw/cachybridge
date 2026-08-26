@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Service
+Name=CachyBridge
+MimeType=application/octet-stream;
+X-KDE-Protocols=file
+X-KDE-MinNumberOfUrls=1
+X-KDE-MaxNumberOfUrls=256
+X-KDE-Submenu=CachyBridge
+Actions=sendToPairedIMac;
+
+[Desktop Action sendToPairedIMac]
+Name=Send to paired iMac
+Icon=network-connect
+Exec=cachybridge send-files -- %F

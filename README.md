@@ -134,10 +134,11 @@ sudo target/release/cachybridge kernel-self-test
   a second Noise-PSK connection while a seamless session is running. It
   requires the `wl-clipboard` package (`wl-copy` and `wl-paste`) on both
   desktops and limits a single text/image item to 8 MiB.
-- Copying one or more regular local files starts an encrypted, streaming
-  transfer offer. The receiving iMac must explicitly accept the KDE popup
-  before bytes are sent. Files are never loaded wholesale into RAM: accepted
-  files are staged privately, published in `Downloads/CachyBridge`, and put on
-  the desktop as a normal file clipboard selection. A 64 GiB aggregate
-  safeguard protects the receiver's disk. Directories, remote URLs, and
-  duplicate file names are intentionally not transferred.
+- In Dolphin, select regular local files and choose **Actions → CachyBridge →
+  Send to paired iMac**. This opens an encrypted, streaming transfer offer
+  without changing the clipboard. The receiving iMac must explicitly accept
+  the KDE popup before bytes are sent. Accepted files are staged privately,
+  published in `Downloads/CachyBridge`, and put on the desktop as a normal file
+  clipboard selection. A 64 GiB aggregate safeguard protects the receiver's
+  disk. Directories, remote URLs, and duplicate file names are intentionally
+  not transferred.

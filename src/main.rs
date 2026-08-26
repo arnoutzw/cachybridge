@@ -28,7 +28,7 @@ use std::{
     io,
     io::Write,
     net::{SocketAddr, TcpListener, TcpStream},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::PathBuf,
     process::Command as ProcessCommand,
     sync::mpsc::{sync_channel, Receiver, TryRecvError},
@@ -255,6 +255,21 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Offer selected local files to the paired iMac without using the
+    /// clipboard. This is used by the Dolphin "Send with CachyBridge" action.
+    SendFiles {
+        /// Configured peer ID. Omit when exactly one iMac is paired.
+        #[arg(long)]
+        peer: Option<String>,
+        /// Use this configuration file instead of the normal per-user path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// One or more regular local files selected in the file manager.
+        #[arg(required = true, trailing_var_arg = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Install the local Dolphin context-menu action for explicit file offers.
+    InstallDolphinMenu,
     /// List local evdev devices that can be passed to `host --device`.
     Devices,
     /// Probe Wayland portal and libei capabilities without requesting consent.
@@ -693,6 +708,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             peer,
             config: config_override,
         } => run_clipboard_sync(config_override, &peer),
+        Command::SendFiles {
+            peer,
+            config: config_override,
+            files,
+        } => run_send_files(config_override, peer.as_deref(), &files),
+        Command::InstallDolphinMenu => {
+            println!("{}", install_dolphin_service_menu()?.display());
+            Ok(())
+        }
         Command::Devices => {
             let devices = list_input_devices();
             if devices.is_empty() {
@@ -1269,15 +1293,35 @@ fn spawn_clipboard_client(peer: config::PeerConfig) -> Result<(), Box<dyn std::e
     std::thread::spawn(move || loop {
         match listener.accept() {
             Ok((stream, remote)) => {
-                match SecureConnection::connect(stream, Role::Client, peer.psk()) {
-                    Ok(connection) => {
-                        eprintln!("clipboard peer connected from {remote}");
-                        if let Err(error) = clipboard::run(connection) {
-                            eprintln!("clipboard session ended: {error}");
+                let peer = peer.clone();
+                std::thread::spawn(move || {
+                    match SecureConnection::connect(stream, Role::Client, peer.psk()) {
+                        Ok(mut connection) => {
+                            eprintln!("clipboard peer connected from {remote}");
+                            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                                // The direct Dolphin action marks its first record,
+                                // allowing a short-lived file offer to coexist with
+                                // the continuous text/image clipboard connection.
+                                let first_record = connection.receive_payload()?;
+                                if clipboard::is_direct_file_offer(&first_record) {
+                                    clipboard::receive_direct_file_offer(connection, first_record)?;
+                                } else {
+                                    clipboard::run_with_initial_payload(
+                                        connection,
+                                        Some(first_record),
+                                    )?;
+                                }
+                                Ok(())
+                            })();
+                            if let Err(error) = result {
+                                eprintln!("clipboard session ended: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("ignored clipboard connection from {remote}: {error}")
                         }
                     }
-                    Err(error) => eprintln!("ignored clipboard connection from {remote}: {error}"),
-                }
+                });
             }
             Err(error) => {
                 eprintln!("clipboard listener stopped: {error}");
@@ -1316,6 +1360,54 @@ fn run_clipboard_sync(
     let connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
     clipboard::run(connection)?;
     Ok(())
+}
+
+fn run_send_files(
+    config_override: Option<PathBuf>,
+    requested_peer: Option<&str>,
+    files: &[PathBuf],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = resolve_config_path(config_override)?;
+    let bridge_config = config::load_or_default(&path)?;
+    let peer = match requested_peer {
+        Some(peer_id) => bridge_config.peer(peer_id)?.clone(),
+        None if bridge_config.peers.len() == 1 => bridge_config.peers[0].clone(),
+        None if bridge_config.peers.is_empty() => {
+            return Err("pair an iMac before sending files".into());
+        }
+        None => {
+            return Err("multiple iMacs are paired; select a target with --peer".into());
+        }
+    };
+    let address = SocketAddr::new(peer.client_endpoint.ip(), DEFAULT_CLIPBOARD_PORT);
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(8))?;
+    let connection = SecureConnection::connect(stream, Role::Host, peer.psk())?;
+    match clipboard::send_files(connection, files)? {
+        clipboard::FileTransferOutcome::Completed => {
+            println!("file transfer completed: {} file(s)", files.len());
+        }
+        clipboard::FileTransferOutcome::Declined => {
+            println!("file transfer declined by {}", peer.name);
+        }
+    }
+    Ok(())
+}
+
+fn install_dolphin_service_menu() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or("could not determine the local data directory")?;
+    let path = base.join("kio/servicemenus/cachybridge-send.desktop");
+    let executable = std::env::current_exe()?;
+    fs::create_dir_all(path.parent().ok_or("invalid service-menu path")?)?;
+    let desktop = format!(
+        "[Desktop Entry]\nType=Service\nName=CachyBridge\nMimeType=application/octet-stream;\nX-KDE-Protocols=file\nX-KDE-MinNumberOfUrls=1\nX-KDE-MaxNumberOfUrls=256\nX-KDE-Submenu=CachyBridge\nActions=sendToPairedIMac;\n\n[Desktop Action sendToPairedIMac]\nName=Send to paired iMac\nIcon=network-connect\nExec={} send-files -- %F\n",
+        executable.display()
+    );
+    fs::write(&path, desktop)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    Ok(path)
 }
 
 #[allow(clippy::too_many_arguments)]

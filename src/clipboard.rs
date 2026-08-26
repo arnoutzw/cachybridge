@@ -28,6 +28,7 @@ const FILE_CHUNK_KIND: u8 = 4;
 const FILE_FINISH_KIND: u8 = 5;
 const FILE_ACCEPT_KIND: u8 = 6;
 const FILE_REJECT_KIND: u8 = 7;
+const DIRECT_FILE_START_KIND: u8 = 8;
 const START_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 1 + 4;
 const CHUNK_HEADER_BYTES: usize = RECORD_PREFIX.len() + 1 + 8 + 4;
 // `poll_receive_payload` intentionally waits until a complete encrypted record
@@ -119,6 +120,12 @@ enum ReceivedClipboard {
     Files(FileSelection),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileTransferOutcome {
+    Completed,
+    Declined,
+}
+
 #[derive(Debug, Error)]
 pub enum ClipboardError {
     #[error("clipboard synchronization requires wl-clipboard (install the wl-clipboard package)")]
@@ -145,7 +152,14 @@ pub enum ClipboardError {
 
 /// Continuously mirrors text and image content. Each received value becomes
 /// the local baseline before polling again, preventing A→B→A echo loops.
-pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
+pub fn run(connection: SecureConnection) -> Result<(), ClipboardError> {
+    run_with_initial_payload(connection, None)
+}
+
+pub fn run_with_initial_payload(
+    mut connection: SecureConnection,
+    mut initial_record: Option<Vec<u8>>,
+) -> Result<(), ClipboardError> {
     let mut last_value: Option<ClipboardContent> = None;
     let mut incoming: Option<IncomingTransfer> = None;
     let mut incoming_files: Option<IncomingFileTransfer> = None;
@@ -161,7 +175,11 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
         // Drain a bounded batch.  The former one-record-per-10ms loop capped
         // transfers at about 1.6 MiB/s regardless of network capacity.
         for _ in 0..64 {
-            let Some(record) = connection.poll_receive_payload()? else {
+            let record = if let Some(record) = initial_record.take() {
+                record
+            } else if let Some(record) = connection.poll_receive_payload()? {
+                record
+            } else {
                 break;
             };
             if let Some(received) = process_received_record(
@@ -188,26 +206,11 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
                         thread::sleep(IDLE_INTERVAL);
                         continue;
                     }
-                    if last_file_selection.as_ref() != Some(&selection) {
-                        // A user-originated replacement must retire our previous
-                        // provider before it can reassert the stale selection.
-                        stop_provider(&mut provider);
-                        send_file_transfer(
-                            &mut connection,
-                            &selection,
-                            &mut incoming,
-                            &mut incoming_files,
-                            &mut provider,
-                            &mut last_value,
-                            &mut last_file_selection,
-                        )?;
-                        eprintln!(
-                            "clipboard sent {} file(s) ({} bytes)",
-                            selection.files.len(),
-                            selection.total_bytes
-                        );
-                        last_file_selection = Some(selection);
-                    }
+                    // File transfers are intentionally explicit: Dolphin's
+                    // CachyBridge service-menu action invokes `send-files`.
+                    // This preserves normal copy/paste semantics and avoids
+                    // offering an accidental file clipboard selection.
+                    last_file_selection = Some(selection);
                 }
                 Ok(None) => {
                     match read_content() {
@@ -262,6 +265,59 @@ pub fn run(mut connection: SecureConnection) -> Result<(), ClipboardError> {
 
 fn record_kind(record: &[u8]) -> Option<u8> {
     record.strip_prefix(RECORD_PREFIX)?.first().copied()
+}
+
+pub fn is_direct_file_offer(record: &[u8]) -> bool {
+    record_kind(record) == Some(DIRECT_FILE_START_KIND)
+}
+
+pub fn send_files(
+    mut connection: SecureConnection,
+    paths: &[PathBuf],
+) -> Result<FileTransferOutcome, ClipboardError> {
+    let selection = file_selection_from_paths(paths)?;
+    let mut incoming = None;
+    let mut incoming_files = None;
+    let mut provider = None;
+    let mut last_value = None;
+    let mut last_file_selection = None;
+    send_file_transfer(
+        &mut connection,
+        &selection,
+        &mut incoming,
+        &mut incoming_files,
+        &mut provider,
+        &mut last_value,
+        &mut last_file_selection,
+        DIRECT_FILE_START_KIND,
+    )
+}
+
+pub fn receive_direct_file_offer(
+    mut connection: SecureConnection,
+    first_record: Vec<u8>,
+) -> Result<(), ClipboardError> {
+    let mut incoming = None;
+    let mut provider = None;
+    if let Some(selection) = receive_file_record(&mut connection, &first_record, &mut incoming)? {
+        write_uri_list(&selection, &mut provider)?;
+        return Ok(());
+    }
+    // A declined offer has no receiver state and no payload will follow.
+    if incoming.is_none() {
+        return Ok(());
+    }
+    loop {
+        let record = connection.receive_payload()?;
+        if let Some(selection) = receive_file_record(&mut connection, &record, &mut incoming)? {
+            write_uri_list(&selection, &mut provider)?;
+            eprintln!(
+                "received explicit file offer: {} file(s) into Downloads/CachyBridge",
+                selection.files.len()
+            );
+            return Ok(());
+        }
+    }
 }
 
 fn is_received_file_selection(selection: &FileSelection) -> bool {
@@ -330,6 +386,7 @@ fn update_received_baseline(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_file_transfer(
     connection: &mut SecureConnection,
     selection: &FileSelection,
@@ -338,7 +395,8 @@ fn send_file_transfer(
     provider: &mut Option<std::process::Child>,
     last_value: &mut Option<ClipboardContent>,
     last_file_selection: &mut Option<FileSelection>,
-) -> Result<(), ClipboardError> {
+    start_kind: u8,
+) -> Result<FileTransferOutcome, ClipboardError> {
     if selection.files.is_empty()
         || selection.files.len() > MAX_FILE_COUNT
         || selection.total_bytes > MAX_FILE_TRANSFER_BYTES
@@ -360,7 +418,7 @@ fn send_file_transfer(
         started,
         None,
     )?;
-    connection.send_payload(&encode_file_start(id, selection)?)?;
+    connection.send_payload(&encode_file_start_with_kind(id, selection, start_kind)?)?;
     if !wait_for_file_approval(
         connection,
         id,
@@ -372,7 +430,7 @@ fn send_file_transfer(
         selection,
         started,
     )? {
-        return Ok(());
+        return Ok(FileTransferOutcome::Declined);
     }
     let mut last_status = started;
     let mut transferred = 0_u64;
@@ -442,7 +500,7 @@ fn send_file_transfer(
         started,
         None,
     )?;
-    Ok(())
+    Ok(FileTransferOutcome::Completed)
 }
 
 fn drain_records_while_sending(
@@ -545,14 +603,26 @@ fn random_transfer_id() -> u64 {
     u64::from_be_bytes(id_bytes)
 }
 
+#[cfg(test)]
 fn encode_file_start(id: u64, selection: &FileSelection) -> Result<Vec<u8>, ClipboardError> {
+    encode_file_start_with_kind(id, selection, FILE_START_KIND)
+}
+
+fn encode_file_start_with_kind(
+    id: u64,
+    selection: &FileSelection,
+    kind: u8,
+) -> Result<Vec<u8>, ClipboardError> {
+    if !matches!(kind, FILE_START_KIND | DIRECT_FILE_START_KIND) {
+        return Err(ClipboardError::InvalidRecord);
+    }
     if selection.files.is_empty() || selection.files.len() > MAX_FILE_COUNT {
         return Err(ClipboardError::InvalidFileBundle);
     }
     let mut total = 0_u64;
     let mut record = Vec::with_capacity(32 + selection.files.len() * 32);
     record.extend_from_slice(RECORD_PREFIX);
-    record.push(FILE_START_KIND);
+    record.push(kind);
     record.extend_from_slice(&id.to_be_bytes());
     record.extend_from_slice(&(selection.files.len() as u16).to_be_bytes());
     record.extend_from_slice(&selection.total_bytes.to_be_bytes());
@@ -747,7 +817,7 @@ fn receive_file_record(
         return Err(ClipboardError::InvalidRecord);
     };
     match kind {
-        FILE_START_KIND => {
+        FILE_START_KIND | DIRECT_FILE_START_KIND => {
             if incoming.is_some() {
                 return Err(ClipboardError::InvalidRecord);
             }
@@ -1121,16 +1191,23 @@ fn stop_provider(provider: &mut Option<std::process::Child>) {
 
 fn file_selection_from_uri_list(uri_list: &[u8]) -> Result<FileSelection, ClipboardError> {
     let uri_list = std::str::from_utf8(uri_list).map_err(|_| ClipboardError::InvalidFileBundle)?;
-    let mut files = Vec::new();
-    let mut names = HashSet::new();
-    let mut total_bytes = 0_u64;
+    let mut paths = Vec::new();
     for line in uri_list
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
-        let path = file_uri_to_path(line)?;
-        let metadata = match fs::metadata(&path) {
+        paths.push(file_uri_to_path(line)?);
+    }
+    file_selection_from_paths(&paths)
+}
+
+fn file_selection_from_paths(paths: &[PathBuf]) -> Result<FileSelection, ClipboardError> {
+    let mut files = Vec::new();
+    let mut names = HashSet::new();
+    let mut total_bytes = 0_u64;
+    for path in paths {
+        let metadata = match fs::metadata(path) {
             Ok(metadata) if metadata.is_file() => metadata,
             _ => continue,
         };
@@ -1141,7 +1218,7 @@ fn file_selection_from_uri_list(uri_list: &[u8]) -> Result<FileSelection, Clipbo
         if total_bytes > MAX_FILE_TRANSFER_BYTES || files.len() == MAX_FILE_COUNT {
             return Err(ClipboardError::TooLarge);
         }
-        let name = safe_file_name(&path)?;
+        let name = safe_file_name(path)?;
         if !names.insert(name.clone()) {
             return Err(ClipboardError::InvalidFileBundle);
         }
@@ -1153,7 +1230,7 @@ fn file_selection_from_uri_list(uri_list: &[u8]) -> Result<FileSelection, Clipbo
             .unwrap_or(0);
         files.push(LocalFile {
             name,
-            path,
+            path: path.clone(),
             size,
             modified_nanos,
         });
@@ -1764,6 +1841,23 @@ mod tests {
             decode_file_decision(&accepted, 7),
             Err(ClipboardError::InvalidRecord)
         ));
+    }
+
+    #[test]
+    fn direct_file_offer_is_distinct_from_clipboard_sync() {
+        let selection = FileSelection {
+            files: vec![LocalFile {
+                name: "report.pdf".to_owned(),
+                path: PathBuf::from("/tmp/report.pdf"),
+                size: 1,
+                modified_nanos: 0,
+            }],
+            total_bytes: 1,
+        };
+        let direct = encode_file_start_with_kind(9, &selection, DIRECT_FILE_START_KIND).unwrap();
+        let regular = encode_file_start(9, &selection).unwrap();
+        assert!(is_direct_file_offer(&direct));
+        assert!(!is_direct_file_offer(&regular));
     }
 
     #[test]

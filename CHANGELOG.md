@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.2.0 — 2026-08-26
+
+- Added Dolphin `Actions → CachyBridge → Send to paired iMac` for explicit
+  AirDrop-style file offers without touching the clipboard.
+- Automatic file clipboard syncing is disabled; text and image clipboard
+  sharing remains unchanged.
+
 ## 4.1.1 — 2026-08-26
 
 - File clipboard copies are now offers: the receiving iMac must explicitly
