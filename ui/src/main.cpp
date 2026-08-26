@@ -54,6 +54,7 @@
 #include <functional>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <optional>
 
 namespace {
@@ -1002,7 +1003,11 @@ protected:
             return;
         }
 
-        constexpr double yMaximum = 60.0;
+        const double movingAverage = std::accumulate(samples_.cbegin(), samples_.cend(), 0.0)
+            / static_cast<double>(samples_.size());
+        // With a zero baseline, twice the rolling average places the average
+        // precisely at the vertical midpoint while letting the scale breathe.
+        const double yMaximum = std::max(1.0, movingAverage * 2.0);
         const auto yFor = [&bounds, yMaximum](double milliseconds) {
             return bounds.bottom() - std::min(milliseconds, yMaximum) / yMaximum * bounds.height();
         };
@@ -1011,8 +1016,18 @@ protected:
                 : bounds.left() + static_cast<double>(index) / (count - 1) * bounds.width();
         };
 
-        painter.setPen(QPen(border, 1, Qt::DashLine));
+        painter.setPen(QPen(border, 1, Qt::DotLine));
+        for (int grid = 1; grid < 8; ++grid) {
+            const double x = bounds.left() + bounds.width() * grid / 8.0;
+            painter.drawLine(QPointF(x, bounds.top()), QPointF(x, bounds.bottom()));
+        }
+        for (int grid = 1; grid < 6; ++grid) {
+            const double y = bounds.top() + bounds.height() * grid / 6.0;
+            painter.drawLine(QPointF(bounds.left(), y), QPointF(bounds.right(), y));
+        }
         for (double milliseconds : {8.33, 16.67}) {
+            if (milliseconds > yMaximum)
+                continue;
             const double y = yFor(milliseconds);
             painter.drawLine(QPointF(bounds.left(), y), QPointF(bounds.right(), y));
             painter.drawText(QRectF(2, y - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
@@ -1020,9 +1035,17 @@ protected:
         }
         painter.setPen(QPen(border, 1));
         painter.drawText(QRectF(2, bounds.top() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
-            QStringLiteral("60"));
+            QString::number(yMaximum, 'f', yMaximum < 10.0 ? 1 : 0));
         painter.drawText(QRectF(2, bounds.bottom() - 9, 46, 18), Qt::AlignRight | Qt::AlignVCenter,
             QStringLiteral("0"));
+
+        painter.setPen(QPen(palette().color(QPalette::Highlight), 1, Qt::DashLine));
+        const double averageY = yFor(movingAverage);
+        painter.drawLine(QPointF(bounds.left(), averageY), QPointF(bounds.right(), averageY));
+        painter.setPen(foreground);
+        painter.drawText(QRectF(bounds.left() + 4, averageY - 10, 90, 18),
+            Qt::AlignLeft | Qt::AlignVCenter,
+            QStringLiteral("avg %1 ms").arg(movingAverage, 0, 'f', 2));
 
         QPainterPath path;
         for (int index = 0; index < samples_.size(); ++index) {
