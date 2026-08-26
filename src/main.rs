@@ -1635,19 +1635,23 @@ fn run_seamless_host(
             format!("invalid peer layout: {error:?}"),
         )
     })?;
-    eprintln!("starting InputCapture left-edge session; portal consent is required");
-    let capture = seamless::InputCaptureAdapter::start_left(local.x)?;
-    run_seamless_host_with_capture(peer, psk, local, remote, handoff::Edge::Left, capture)
+    run_seamless_host_with_capture(peer, psk, local, remote, handoff::Edge::Left, || {
+        eprintln!("starting InputCapture left-edge session; portal consent is required");
+        seamless::InputCaptureAdapter::start_left(local.x)
+    })
 }
 
-fn run_seamless_host_with_capture(
+fn run_seamless_host_with_capture<F>(
     peer: SocketAddr,
     psk: [u8; 32],
     local: handoff::Rect,
     remote: handoff::Rect,
     edge: handoff::Edge,
-    capture: seamless::InputCaptureAdapter,
-) -> Result<(), Box<dyn std::error::Error>> {
+    start_capture: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> Result<seamless::InputCaptureAdapter, Box<dyn std::error::Error>>,
+{
     eprintln!("connecting seamless host to client at {peer}");
     // A client starts two portal sessions before it opens its input listener.
     // On a fresh GUI pairing Plasma may wait for the user to approve those
@@ -1657,6 +1661,10 @@ fn run_seamless_host_with_capture(
     let stream = connect_seamless_peer(peer, Duration::from_secs(60))?;
     let connection = SecureConnection::connect(stream, Role::Host, &psk)?;
     connection.set_read_timeout(Some(Duration::from_millis(PEER_TIMEOUT_MS)))?;
+    // Do not request InputCapture until the configured client has accepted
+    // the authenticated LAN connection. An offline iMac must never cause a
+    // repeating desktop-portal permission request on the host.
+    let capture = start_capture()?;
     let controller = handoff::HandoffController::new(local, remote, edge);
     let mut host = seamless::SeamlessHost::new(controller, capture, connection);
 
@@ -1749,32 +1757,36 @@ fn run_seamless_host_config(
             format!("invalid peer layout: {error:?}"),
         )
     })?;
-    eprintln!("starting configured InputCapture edge session; portal consent may be required");
-    let mut capture = seamless::InputCaptureAdapter::start_with_persistence(
-        capture_edge,
-        capture_x,
-        portal_persistence(peer.persistent_permissions, peer.capture_restore_token())?,
-    )?;
-    if peer.persistent_permissions {
-        persist_returned_tokens(
-            &path,
-            &mut bridge_config,
-            &peer.id,
-            config::RestoreTokenUpdates::capture(
-                capture
-                    .take_restore_token()
-                    .map(|token| token.into_secret()),
-            ),
-        )?;
-    }
-    spawn_clipboard_host(peer.clone());
     run_seamless_host_with_capture(
         peer.client_endpoint,
         *peer.psk(),
         local,
         remote,
         edge,
-        capture,
+        || {
+            eprintln!(
+                "starting configured InputCapture edge session; portal consent may be required"
+            );
+            let mut capture = seamless::InputCaptureAdapter::start_with_persistence(
+                capture_edge,
+                capture_x,
+                portal_persistence(peer.persistent_permissions, peer.capture_restore_token())?,
+            )?;
+            if peer.persistent_permissions {
+                persist_returned_tokens(
+                    &path,
+                    &mut bridge_config,
+                    &peer.id,
+                    config::RestoreTokenUpdates::capture(
+                        capture
+                            .take_restore_token()
+                            .map(|token| token.into_secret()),
+                    ),
+                )?;
+            }
+            spawn_clipboard_host(peer.clone());
+            Ok(capture)
+        },
     )
 }
 
